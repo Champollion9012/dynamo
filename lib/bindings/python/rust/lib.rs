@@ -1046,6 +1046,10 @@ impl ModelType {
         inner: llm_rs::model_type::ModelType::Audios,
     };
     #[classattr]
+    const Transcriptions: Self = ModelType {
+        inner: llm_rs::model_type::ModelType::Transcriptions,
+    };
+    #[classattr]
     const Videos: Self = ModelType {
         inner: llm_rs::model_type::ModelType::Videos,
     };
