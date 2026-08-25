@@ -19,6 +19,9 @@ use dynamo_kv_router::services::selection::{SelectionService, WorkerSelectionPol
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
+use crate::epp_standalone_config::{
+    DISAGGREGATED_TOPOLOGY, DYN_EPP_MODE, DYN_EPP_TOPOLOGY_MODE, EppTopologyMode, STANDALONE_MODE,
+};
 use crate::{EppMode, EppStandaloneConfig, ExtProcServer, Router, Selector, metrics};
 
 const GRPC_PORT: u16 = 9002;
@@ -203,6 +206,18 @@ pub async fn run_with_worker_selection_policy_registry(
     .await
 }
 
+/// A role split only exists in standalone mode; the Dynamo-runtime path has its
+/// own disaggregation story and never reads this setting.
+fn reject_disaggregated_outside_standalone(mode: EppMode, topology: EppTopologyMode) -> Result<()> {
+    if topology.is_disaggregated() && !matches!(mode, EppMode::Standalone) {
+        anyhow::bail!(
+            "{DYN_EPP_TOPOLOGY_MODE}={DISAGGREGATED_TOPOLOGY} requires \
+             {DYN_EPP_MODE}={STANDALONE_MODE}; the Dynamo-runtime EPP does not read it"
+        );
+    }
+    Ok(())
+}
+
 fn require_standalone_mode_for_linked_worker_selection_policy(mode: EppMode) -> Result<()> {
     if matches!(mode, EppMode::Standalone) {
         return Ok(());
@@ -224,6 +239,12 @@ async fn run_inner(
     standalone_selection_service: StandaloneSelectionService,
 ) -> Result<()> {
     let standalone = matches!(mode, EppMode::Standalone);
+
+    // Read before the mode branch: `EppStandaloneConfig::from_env` is only
+    // reached inside it, so a disaggregated topology set alongside the default
+    // runtime mode would otherwise be silently ignored — and every pool-selected
+    // pod, prefill included, would stay a routable destination.
+    reject_disaggregated_outside_standalone(mode, EppTopologyMode::from_env()?)?;
 
     let config = Config::from_env();
 
@@ -422,6 +443,29 @@ async fn serve<P: crate::EndpointPicker>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disaggregated_requires_standalone_mode() {
+        // The failure this guards is silent by construction: without it the
+        // setting is simply never read.
+        let error = reject_disaggregated_outside_standalone(
+            EppMode::DynamoRuntime,
+            EppTopologyMode::Disaggregated,
+        )
+        .expect_err("disaggregated must not be silently ignored under the runtime mode")
+        .to_string();
+        assert!(error.contains(DYN_EPP_MODE), "{error}");
+        assert!(error.contains(STANDALONE_MODE), "{error}");
+
+        // The other three combinations are all legitimate.
+        for (mode, topology) in [
+            (EppMode::Standalone, EppTopologyMode::Disaggregated),
+            (EppMode::Standalone, EppTopologyMode::Aggregated),
+            (EppMode::DynamoRuntime, EppTopologyMode::Aggregated),
+        ] {
+            assert!(reject_disaggregated_outside_standalone(mode, topology).is_ok());
+        }
+    }
 
     #[test]
     fn linked_policy_requires_standalone_epp() {
