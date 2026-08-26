@@ -25,6 +25,7 @@ import (
 
 	nvidiacomv1alpha1 "github.com/ai-dynamo/dynamo/deploy/operator/api/v1alpha1"
 	nvidiacomv1beta1 "github.com/ai-dynamo/dynamo/deploy/operator/api/v1beta1"
+	"github.com/ai-dynamo/dynamo/deploy/operator/internal/dgdoverride"
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/features"
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/runtimeversion"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
@@ -53,18 +54,6 @@ func (v *dynamoGraphDeploymentRequestValidation) warn(message string) {
 	v.warnings = append(v.warnings, message)
 }
 
-var deprecatedDGDRDGDComponentNames = map[string]string{
-	"VllmWorker":          "worker",
-	"VllmPrefillWorker":   "prefill",
-	"VllmDecodeWorker":    "worker for aggregate deployments or decode for disaggregated deployments",
-	"TRTLLMPrefillWorker": "prefill",
-	"TRTLLMDecodeWorker":  "decode",
-	"SGLangPrefillWorker": "prefill",
-	"SGLangDecodeWorker":  "worker for aggregate deployments or decode for disaggregated deployments",
-	"SglangPrefillWorker": "prefill",
-	"SglangDecodeWorker":  "worker for aggregate deployments or decode for disaggregated deployments",
-}
-
 // Validate performs stateless validation on request. ctx and request must not be nil.
 func (v *DynamoGraphDeploymentRequestValidator) Validate(
 	ctx context.Context,
@@ -83,7 +72,7 @@ func (v *DynamoGraphDeploymentRequestValidator) ValidateUpdate(
 ) (admission.Warnings, error) {
 	validation := &dynamoGraphDeploymentRequestValidation{ctx: ctx}
 	allErrs := validation.validateDynamoGraphDeploymentRequestUpdate(newRequest, oldRequest)
-	validation.warnDeprecatedDGDOverrideComponentNames(&newRequest.Spec)
+	validation.warnDeprecatedDGDOverrideTargets(&newRequest.Spec)
 	return validation.warnings, invalidDynamoGraphDeploymentRequestError(newRequest, allErrs)
 }
 
@@ -124,12 +113,12 @@ func (v *dynamoGraphDeploymentRequestValidation) validateDynamoGraphDeploymentRe
 		))
 	}
 
-	v.warnDeprecatedDGDOverrideComponentNames(spec)
+	v.warnDeprecatedDGDOverrideTargets(spec)
 
 	return allErrs
 }
 
-func (v *dynamoGraphDeploymentRequestValidation) warnDeprecatedDGDOverrideComponentNames(
+func (v *dynamoGraphDeploymentRequestValidation) warnDeprecatedDGDOverrideTargets(
 	spec *nvidiacomv1beta1.DynamoGraphDeploymentRequestSpec,
 ) {
 	if spec.Overrides == nil || spec.Overrides.DGD == nil {
@@ -141,11 +130,12 @@ func (v *dynamoGraphDeploymentRequestValidation) warnDeprecatedDGDOverrideCompon
 		return
 	}
 
-	type deprecatedName struct {
-		name string
-		path string
+	type deprecatedTarget struct {
+		name            string
+		path            string
+		replacementHint string
 	}
-	deprecated := make([]deprecatedName, 0)
+	deprecated := make([]deprecatedTarget, 0)
 	switch override.GetAPIVersion() {
 	case nvidiacomv1alpha1.GroupVersion.String():
 		services, _, err := unstructured.NestedMap(override.Object, "spec", "services")
@@ -153,10 +143,12 @@ func (v *dynamoGraphDeploymentRequestValidation) warnDeprecatedDGDOverrideCompon
 			return
 		}
 		for name := range services {
-			if _, found := deprecatedDGDRDGDComponentNames[name]; found {
-				deprecated = append(deprecated, deprecatedName{
-					name: name,
-					path: "spec.overrides.dgd.spec.services." + name,
+			replacementHint, found := dgdoverride.DeprecatedDGDOverrideTargetReplacementHint(name)
+			if found {
+				deprecated = append(deprecated, deprecatedTarget{
+					name:            name,
+					path:            "spec.overrides.dgd.spec.services." + name,
+					replacementHint: replacementHint,
 				})
 			}
 		}
@@ -171,10 +163,12 @@ func (v *dynamoGraphDeploymentRequestValidation) warnDeprecatedDGDOverrideCompon
 				continue
 			}
 			name, _ := component["name"].(string)
-			if _, found := deprecatedDGDRDGDComponentNames[name]; found {
-				deprecated = append(deprecated, deprecatedName{
-					name: name,
-					path: fmt.Sprintf("spec.overrides.dgd.spec.components[name=%s]", name),
+			replacementHint, found := dgdoverride.DeprecatedDGDOverrideTargetReplacementHint(name)
+			if found {
+				deprecated = append(deprecated, deprecatedTarget{
+					name:            name,
+					path:            fmt.Sprintf("spec.overrides.dgd.spec.components[name=%s]", name),
+					replacementHint: replacementHint,
 				})
 			}
 		}
@@ -187,10 +181,10 @@ func (v *dynamoGraphDeploymentRequestValidation) warnDeprecatedDGDOverrideCompon
 	})
 	for _, item := range deprecated {
 		v.warn(fmt.Sprintf(
-			"%s: generated component name %q is deprecated; use %s",
+			"%s: override target %q is deprecated; use %s. Legacy-name translation will be removed in a future release",
 			item.path,
 			item.name,
-			deprecatedDGDRDGDComponentNames[item.name],
+			item.replacementHint,
 		))
 	}
 }

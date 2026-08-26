@@ -183,9 +183,9 @@ func TestDynamoGraphDeploymentRequestValidator_Validate(t *testing.T) {
 			}),
 			gpuDiscovery: true,
 			wantWarnings: []string{
-				`spec.overrides.dgd.spec.components[name=SGLangDecodeWorker]: generated component name "SGLangDecodeWorker" is deprecated; use worker for aggregate deployments or decode for disaggregated deployments`,
-				`spec.overrides.dgd.spec.components[name=TRTLLMPrefillWorker]: generated component name "TRTLLMPrefillWorker" is deprecated; use prefill`,
-				`spec.overrides.dgd.spec.components[name=VllmWorker]: generated component name "VllmWorker" is deprecated; use worker`,
+				`spec.overrides.dgd.spec.components[name=SGLangDecodeWorker]: override target "SGLangDecodeWorker" is deprecated; use worker (aggregate) or decode (disaggregated). Legacy-name translation will be removed in a future release`,
+				`spec.overrides.dgd.spec.components[name=TRTLLMPrefillWorker]: override target "TRTLLMPrefillWorker" is deprecated; use prefill. Legacy-name translation will be removed in a future release`,
+				`spec.overrides.dgd.spec.components[name=VllmWorker]: override target "VllmWorker" is deprecated; use worker. Legacy-name translation will be removed in a future release`,
 			},
 		},
 		{
@@ -197,8 +197,8 @@ func TestDynamoGraphDeploymentRequestValidator_Validate(t *testing.T) {
 			}),
 			gpuDiscovery: true,
 			wantWarnings: []string{
-				`spec.overrides.dgd.spec.services.TRTLLMDecodeWorker: generated component name "TRTLLMDecodeWorker" is deprecated; use decode`,
-				`spec.overrides.dgd.spec.services.VllmDecodeWorker: generated component name "VllmDecodeWorker" is deprecated; use worker for aggregate deployments or decode for disaggregated deployments`,
+				`spec.overrides.dgd.spec.services.TRTLLMDecodeWorker: override target "TRTLLMDecodeWorker" is deprecated; use decode. Legacy-name translation will be removed in a future release`,
+				`spec.overrides.dgd.spec.services.VllmDecodeWorker: override target "VllmDecodeWorker" is deprecated; use worker (aggregate) or decode (disaggregated). Legacy-name translation will be removed in a future release`,
 			},
 		},
 
@@ -213,7 +213,7 @@ func TestDynamoGraphDeploymentRequestValidator_Validate(t *testing.T) {
 			}),
 			gpuDiscovery: true,
 			wantWarnings: []string{
-				`spec.overrides.dgd.spec.components[name=VllmPrefillWorker]: generated component name "VllmPrefillWorker" is deprecated; use prefill`,
+				`spec.overrides.dgd.spec.components[name=VllmPrefillWorker]: override target "VllmPrefillWorker" is deprecated; use prefill. Legacy-name translation will be removed in a future release`,
 			},
 		},
 		{
