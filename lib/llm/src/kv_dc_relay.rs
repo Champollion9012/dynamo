@@ -10,6 +10,7 @@ mod identity;
 mod load;
 mod pool_registry;
 mod resolution;
+mod stats;
 mod topology;
 
 pub use discovery::KvDcRelayDiscoveryConfig;
@@ -30,6 +31,7 @@ pub use identity::{
     ModelAlias, ModelAliasError, ModelTarget, PoolIdentitySources, WorkerRole,
 };
 pub use load::PoolLoadSnapshot;
+pub use stats::proto;
 pub use topology::{
     AdapterReadiness, TopologyEntry, TopologyMember, TopologyReadinessState, TopologySnapshot,
 };

@@ -14,7 +14,6 @@ use std::time::Instant;
 
 #[cfg(test)]
 use dynamo_kv_router::indexer::cuckoo::CkfConfig;
-#[cfg(any(test, feature = "ckf-diagnostics"))]
 use dynamo_kv_router::indexer::cuckoo::DcCkfStats;
 #[cfg(feature = "ckf-diagnostics")]
 use dynamo_kv_router::indexer::cuckoo::PublisherEmitOutcome;
@@ -52,6 +51,8 @@ const RECOVERY_REBUILD_BATCH_WINDOW: Duration = Duration::from_millis(5);
 pub(crate) struct DcCkfSubscription {
     pub(crate) snapshot: DcCkfSnapshot,
     pub(crate) deltas: broadcast::Receiver<DcCkfDelta>,
+    pub(crate) stats: DcCkfStats,
+    pub(crate) members: Vec<(WorkerWithDpRank, usize)>,
 }
 
 // NOTE: `dynamo-llm` enables the router's general metrics feature in production. Keep these
@@ -531,7 +532,6 @@ impl KvDcRelayHandle {
             .await
     }
 
-    #[cfg(any(test, feature = "ckf-diagnostics"))]
     pub(super) async fn state_stats(
         &self,
     ) -> Result<(DcCkfStats, u64, Vec<(WorkerWithDpRank, usize)>), KvDcRelayError> {
@@ -551,6 +551,8 @@ impl KvDcRelayHandle {
         Ok(DcCkfSubscription {
             snapshot: subscription.snapshot,
             deltas: subscription.deltas,
+            stats: subscription.stats,
+            members: subscription.members,
         })
     }
 
@@ -893,7 +895,6 @@ impl RecoveryTarget for KvDcRelayRecoveryTarget {
     }
 }
 
-#[cfg(any(test, feature = "ckf-diagnostics"))]
 type ActorStatsResult = Result<(DcCkfStats, u64, Vec<(WorkerWithDpRank, usize)>), KvDcRelayError>;
 
 enum ActorCommand {
@@ -925,7 +926,6 @@ enum ActorCommand {
         lease: LaneLease,
         response: oneshot::Sender<Result<ActorSubscription, KvDcRelayError>>,
     },
-    #[cfg(any(test, feature = "ckf-diagnostics"))]
     Stats {
         response: oneshot::Sender<ActorStatsResult>,
     },
@@ -952,6 +952,8 @@ pub(super) struct ActorSnapshot {
 struct ActorSubscription {
     snapshot: DcCkfSnapshot,
     deltas: broadcast::Receiver<DcCkfDelta>,
+    stats: DcCkfStats,
+    members: Vec<(WorkerWithDpRank, usize)>,
 }
 
 impl ActorCommand {
@@ -1210,11 +1212,17 @@ async fn run_actor(
                         // returns. Subscribe after any old-lease tail so the new receiver starts
                         // exactly after snapshot sequence N.
                         let deltas = publisher.sink().sender.subscribe();
-                        ActorSubscription { snapshot, deltas }
+                        let stats = state.stats();
+                        let members = state.member_counts();
+                        ActorSubscription {
+                            snapshot,
+                            deltas,
+                            stats,
+                            members,
+                        }
                     });
                 let _ = response.send(result);
             }
-            #[cfg(any(test, feature = "ckf-diagnostics"))]
             ActorCommand::Stats { response } => {
                 let _ = response.send(Ok((
                     state.stats(),
