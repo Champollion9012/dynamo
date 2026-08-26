@@ -78,11 +78,10 @@ func TestRunEmitsMigrationWarningForTranslatedTarget(t *testing.T) {
 	require.NoError(t, err)
 
 	t.Log("Verify the CLI reports the exact translation and materializes the override")
-	assert.Contains(
-		t,
-		stderr.String(),
-		`warning: spec.components[name=VllmWorker]: deprecated override target "VllmWorker" translated to "worker"; use "worker" directly. Legacy-name translation will be removed in a future release`,
-	)
+	const expectedWarning = `warning: spec.components[name=VllmWorker]: deprecated override target ` +
+		`"VllmWorker" translated to "worker"; use "worker" directly. ` +
+		`Legacy-name translation will be removed in a future release`
+	assert.Contains(t, stderr.String(), expectedWarning)
 	assert.Equal(t, "new-image", mainContainerImage(t, mustDecodeDGD(t, stdout.Bytes())))
 }
 

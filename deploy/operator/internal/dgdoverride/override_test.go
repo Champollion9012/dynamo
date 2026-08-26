@@ -16,6 +16,8 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
+const alphaAPIVersion = "nvidia.com/v1alpha1"
+
 func TestApplyVersionMatrix(t *testing.T) {
 	t.Parallel()
 
@@ -31,7 +33,7 @@ func TestApplyVersionMatrix(t *testing.T) {
 			name:           "alpha blueprint with alpha override",
 			blueprint:      alphaBlueprintYAML,
 			override:       alphaOverrideYAML,
-			wantAPIVersion: "nvidia.com/v1alpha1",
+			wantAPIVersion: alphaAPIVersion,
 			wantArgs:       []string{"--base", "--override"},
 			wantPreservation: func(t *testing.T, result *unstructured.Unstructured) {
 				pvcs := mustNestedSlice(t, result.Object, "spec", "pvcs")
@@ -43,7 +45,7 @@ func TestApplyVersionMatrix(t *testing.T) {
 			name:           "alpha blueprint with beta override",
 			blueprint:      alphaBlueprintYAML,
 			override:       betaOverrideYAML,
-			wantAPIVersion: "nvidia.com/v1alpha1",
+			wantAPIVersion: alphaAPIVersion,
 			wantArgs:       []string{"--override"},
 			wantPreservation: func(t *testing.T, result *unstructured.Unstructured) {
 				pvcs := mustNestedSlice(t, result.Object, "spec", "pvcs")
@@ -504,7 +506,7 @@ spec:
 			name:           "alpha aggregate",
 			blueprint:      alphaAggregateBlueprint,
 			override:       alphaLegacyOverride,
-			wantAPIVersion: "nvidia.com/v1alpha1",
+			wantAPIVersion: alphaAPIVersion,
 			wantTarget:     "worker",
 			wantWarning:    `spec.services.VllmDecodeWorker: deprecated override target "VllmDecodeWorker" translated to "worker"; use "worker" directly. Legacy-name translation will be removed in a future release`,
 		},
@@ -520,7 +522,7 @@ spec:
 			name:           "alpha disaggregated with beta override",
 			blueprint:      alphaDisaggregatedBlueprint,
 			override:       betaLegacyOverride,
-			wantAPIVersion: "nvidia.com/v1alpha1",
+			wantAPIVersion: alphaAPIVersion,
 			wantTarget:     "decode",
 			wantWarning:    `spec.components[name=VllmDecodeWorker]: deprecated override target "VllmDecodeWorker" translated to "decode"; use "decode" directly. Legacy-name translation will be removed in a future release`,
 		},
@@ -1055,7 +1057,7 @@ func targetReplicas(t *testing.T, object *unstructured.Unstructured, name string
 	t.Helper()
 
 	var value interface{}
-	if object.GetAPIVersion() == "nvidia.com/v1alpha1" {
+	if object.GetAPIVersion() == alphaAPIVersion {
 		var found bool
 		var err error
 		value, found, err = unstructured.NestedFieldNoCopy(object.Object, "spec", "services", name, "replicas")
@@ -1080,7 +1082,7 @@ func targetReplicas(t *testing.T, object *unstructured.Unstructured, name string
 func mainContainer(t *testing.T, object *unstructured.Unstructured) map[string]interface{} {
 	t.Helper()
 	switch object.GetAPIVersion() {
-	case "nvidia.com/v1alpha1":
+	case alphaAPIVersion:
 		container, found, err := unstructured.NestedMap(
 			object.Object,
 			"spec",
@@ -1127,7 +1129,7 @@ func mainContainerArgs(t *testing.T, object *unstructured.Unstructured) []string
 func mainContainerEnv(t *testing.T, object *unstructured.Unstructured) map[string]string {
 	t.Helper()
 	result := map[string]string{}
-	if object.GetAPIVersion() == "nvidia.com/v1alpha1" {
+	if object.GetAPIVersion() == alphaAPIVersion {
 		service, found, err := unstructured.NestedMap(object.Object, "spec", "services", "Worker")
 		require.NoError(t, err)
 		require.True(t, found)
