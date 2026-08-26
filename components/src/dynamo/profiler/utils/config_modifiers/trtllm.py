@@ -17,6 +17,7 @@ from dynamo.profiler.utils.config import (
     get_component_name_by_type,
     get_main_container,
     get_worker_component_from_config,
+    is_mocker_container,
     parse_override_engine_args,
     remove_valued_arguments,
     setup_worker_component_resources,
@@ -220,6 +221,8 @@ def enable_trtllm_chunked_prefill(config: dict) -> dict:
             None,
         )
         if not isinstance(main_container, dict):
+            continue
+        if is_mocker_container(main_container):
             continue
 
         shell_command = _get_shell_form_command(main_container)

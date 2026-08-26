@@ -199,3 +199,23 @@ def test_enable_chunked_prefill_preserves_shell_form_workers():
     override = json.loads(override_tokens[override_index + 1])
     assert override["enable_chunked_prefill"] is True
     assert override["kv_cache_config"]["tokens_per_block"] == 32
+
+
+def test_enable_chunked_prefill_skips_mocker_workers():
+    config = {
+        "spec": {
+            "components": [
+                _component(
+                    "mocker",
+                    "decode",
+                    ["--model-path", "test/model"],
+                    command=["python3", "-m", "dynamo.mocker"],
+                )
+            ]
+        }
+    }
+
+    result = enable_trtllm_chunked_prefill(config)
+
+    container = _main_containers_by_name(result)["mocker"]
+    assert container["args"] == ["--model-path", "test/model"]

@@ -31,6 +31,7 @@ from dynamo.profiler.utils.config import (
     get_component_name_by_type,
     get_main_container,
     get_main_container_dict,
+    is_mocker_container,
     sanitize_cli_args,
     set_unique_argument_value,
     setup_worker_component_resources,
@@ -233,12 +234,6 @@ class BaseConfigModifier:
                 yield main_container
 
     @staticmethod
-    def _is_mocker_container(container: dict) -> bool:
-        command = container.get("command") or []
-        args = container.get("args") or []
-        return "dynamo.mocker" in " ".join(str(token) for token in [*command, *args])
-
-    @staticmethod
     def _is_shell_command(container: dict) -> bool:
         command = container.get("command") or []
         args = container.get("args") or []
@@ -267,8 +262,7 @@ class BaseConfigModifier:
 
         workers = list(cls._worker_containers(config))
         return bool(workers) and all(
-            cls._is_mocker_container(container)
-            or cls._container_has_flag(container, flag)
+            is_mocker_container(container) or cls._container_has_flag(container, flag)
             for container in workers
         )
 
@@ -280,7 +274,7 @@ class BaseConfigModifier:
             return config
 
         for container in cls._worker_containers(config):
-            if cls._is_mocker_container(container) or cls._container_has_flag(
+            if is_mocker_container(container) or cls._container_has_flag(
                 container, flag
             ):
                 continue
