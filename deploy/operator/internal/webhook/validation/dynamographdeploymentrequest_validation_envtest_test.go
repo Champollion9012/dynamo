@@ -33,6 +33,26 @@ import (
 const alternateAdmissionModel = "Qwen/Qwen3-8B"
 
 func TestDynamoGraphDeploymentRequestValidator_Validate(t *testing.T) {
+	const deprecatedV1beta1ComponentNames = `{
+		"apiVersion":"nvidia.com/v1beta1",
+		"kind":"DynamoGraphDeployment",
+		"spec":{"components":[
+			{"name":"VllmWorker"},
+			{"name":"TRTLLMPrefillWorker"},
+			{"name":"SGLangDecodeWorker"}
+		]}
+	}`
+	const deprecatedV1alpha1ServiceNames = `{
+		"apiVersion":"nvidia.com/v1alpha1",
+		"kind":"DynamoGraphDeployment",
+		"spec":{"services":{"VllmDecodeWorker":{},"TRTLLMDecodeWorker":{}}}
+	}`
+	const deprecatedUpdateComponentName = `{
+		"apiVersion":"nvidia.com/v1beta1",
+		"kind":"DynamoGraphDeployment",
+		"spec":{"components":[{"name":"VllmPrefillWorker"}]}
+	}`
+
 	tests := []struct {
 		name               string
 		request            runtime.Object
@@ -153,7 +173,49 @@ func TestDynamoGraphDeploymentRequestValidator_Validate(t *testing.T) {
 			},
 		},
 
+		// Compatibility warnings.
+		{
+			name: "deprecated v1beta1 DGD override component names warn",
+			request: betaDGDRForAdmission(func(request *nvidiacomv1beta1.DynamoGraphDeploymentRequest) {
+				request.Spec.Overrides = &nvidiacomv1beta1.OverridesSpec{
+					DGD: &runtime.RawExtension{Raw: []byte(deprecatedV1beta1ComponentNames)},
+				}
+			}),
+			gpuDiscovery: true,
+			wantWarnings: []string{
+				`spec.overrides.dgd.spec.components[name=SGLangDecodeWorker]: generated component name "SGLangDecodeWorker" is deprecated; use worker for aggregate deployments or decode for disaggregated deployments`,
+				`spec.overrides.dgd.spec.components[name=TRTLLMPrefillWorker]: generated component name "TRTLLMPrefillWorker" is deprecated; use prefill`,
+				`spec.overrides.dgd.spec.components[name=VllmWorker]: generated component name "VllmWorker" is deprecated; use worker`,
+			},
+		},
+		{
+			name: "deprecated v1alpha1 DGD override service names warn",
+			request: betaDGDRForAdmission(func(request *nvidiacomv1beta1.DynamoGraphDeploymentRequest) {
+				request.Spec.Overrides = &nvidiacomv1beta1.OverridesSpec{
+					DGD: &runtime.RawExtension{Raw: []byte(deprecatedV1alpha1ServiceNames)},
+				}
+			}),
+			gpuDiscovery: true,
+			wantWarnings: []string{
+				`spec.overrides.dgd.spec.services.TRTLLMDecodeWorker: generated component name "TRTLLMDecodeWorker" is deprecated; use decode`,
+				`spec.overrides.dgd.spec.services.VllmDecodeWorker: generated component name "VllmDecodeWorker" is deprecated; use worker for aggregate deployments or decode for disaggregated deployments`,
+			},
+		},
+
 		// Structural update rules.
+		{
+			name:       "deprecated DGD override component name warns on update",
+			oldRequest: betaDGDRForAdmission(nil),
+			request: betaDGDRForAdmission(func(request *nvidiacomv1beta1.DynamoGraphDeploymentRequest) {
+				request.Spec.Overrides = &nvidiacomv1beta1.OverridesSpec{
+					DGD: &runtime.RawExtension{Raw: []byte(deprecatedUpdateComponentName)},
+				}
+			}),
+			gpuDiscovery: true,
+			wantWarnings: []string{
+				`spec.overrides.dgd.spec.components[name=VllmPrefillWorker]: generated component name "VllmPrefillWorker" is deprecated; use prefill`,
+			},
+		},
 		{
 			name: "unchanged spec is accepted during profiling",
 			oldRequest: betaDGDRForAdmission(func(request *nvidiacomv1beta1.DynamoGraphDeploymentRequest) {
