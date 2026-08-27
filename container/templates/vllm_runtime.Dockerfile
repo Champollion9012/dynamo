@@ -136,6 +136,10 @@ COPY --chmod=755 container/deps/vllm/validate_axk2_port.py /tmp/validate_axk2_po
 RUN set -eux; \
     cd "${SITE_PACKAGES}"; \
     for patch_file in /tmp/axk2-vllm-patches/*.patch; do \
+        if [ "$(basename "${patch_file}")" = \
+            "0005-fix-kv-cache-round-fp8-ds-mla-tile-scales-for-ue8m0.patch" ]; then \
+            continue; \
+        fi; \
         patch --batch --forward -p1 < "${patch_file}"; \
     done; \
     python3 -m compileall -q \
