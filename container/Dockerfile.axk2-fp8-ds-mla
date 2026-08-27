@@ -12,7 +12,7 @@ FROM ${VLLM_RUNTIME_IMAGE} AS vllm_native_builder
 
 ARG VLLM_SOURCE_REPO=https://github.com/vllm-project/vllm.git
 ARG VLLM_SOURCE_TAG=v0.26.0
-ARG VLLM_SOURCE_COMMIT=568afb3a15c471118256294610260709417c6815
+ARG VLLM_SOURCE_COMMIT=568afb3a13806beb53bb2e6bd518269357b237c0
 ARG TORCH_CUDA_ARCH_LIST=10.0
 ARG MAX_JOBS=128
 ARG NVCC_THREADS=4
@@ -69,7 +69,7 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
 
 FROM ${DYNAMO_AXK2_IMAGE} AS runtime
 
-ARG VLLM_SOURCE_COMMIT=568afb3a15c471118256294610260709417c6815
+ARG VLLM_SOURCE_COMMIT=568afb3a13806beb53bb2e6bd518269357b237c0
 LABEL org.opencontainers.image.vllm.source="https://github.com/vllm-project/vllm" \
       org.opencontainers.image.vllm.revision="${VLLM_SOURCE_COMMIT}" \
       org.opencontainers.image.vllm.axk2.fp8_ds_mla_ue8m0="true"
