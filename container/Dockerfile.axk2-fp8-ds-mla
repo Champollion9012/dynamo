@@ -39,13 +39,15 @@ RUN git clone --branch "${VLLM_SOURCE_TAG}" --depth=1 \
     test "$(git -C vllm rev-parse HEAD)" = "${VLLM_SOURCE_COMMIT}"
 
 COPY --chmod=644 container/patches/vllm/axk2/*.patch /tmp/axk2-vllm-patches/
+COPY --chmod=755 container/deps/vllm/validate_fp8_ds_mla_source_patch.py /usr/local/bin/validate_fp8_ds_mla_source_patch
 RUN set -eux; \
     cd /src/vllm; \
     for patch_file in /tmp/axk2-vllm-patches/*.patch; do \
         patch --batch --forward -p1 < "${patch_file}"; \
     done; \
     test "$(grep -c 'VLLM_DS_MLA_UE8M0_SCALE' \
-        csrc/libtorch_stable/cache_kernels.cu)" -ge 2
+        csrc/libtorch_stable/cache_kernels.cu)" -ge 2; \
+    validate_fp8_ds_mla_source_patch csrc/libtorch_stable/cache_kernels.cu
 
 # Preserve the exact release image's Rust frontend while rebuilding every
 # CMake/CUDA extension from the patched 0.26.0 source tree.

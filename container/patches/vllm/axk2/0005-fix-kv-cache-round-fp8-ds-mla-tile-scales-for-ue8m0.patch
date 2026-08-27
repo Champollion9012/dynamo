@@ -1,4 +1,4 @@
-From 1cc645f233b7715300480f2fdc4210e6ec5d47d7 Mon Sep 17 00:00:00 2001
+From d40f26353e467c837c99700ad8d080fc63bb0bbf Mon Sep 17 00:00:00 2001
 From: Codex <codex@openai.com>
 Date: Thu, 27 Aug 2026 11:53:26 -0700
 Subject: [PATCH] fix(kv-cache): round fp8_ds_mla tile scales for UE8M0 readers
@@ -8,7 +8,7 @@ Subject: [PATCH] fix(kv-cache): round fp8_ds_mla tile scales for UE8M0 readers
  1 file changed, 60 insertions(+), 2 deletions(-)
 
 diff --git a/csrc/libtorch_stable/cache_kernels.cu b/csrc/libtorch_stable/cache_kernels.cu
-index 2d4b47b4b..053ac1f11 100644
+index 2d4b47b4b..c1ca5141b 100644
 --- a/csrc/libtorch_stable/cache_kernels.cu
 +++ b/csrc/libtorch_stable/cache_kernels.cu
 @@ -16,6 +16,7 @@
@@ -53,13 +53,10 @@ index 2d4b47b4b..053ac1f11 100644
    // The first lane of each half-warp writes the scale to kv_cache
    if ((lane_idx == 0) || (lane_idx == 16)) {
      float* kv_cache_32bit = reinterpret_cast<float*>(&kv_cache[dst_idx_start]);
-@@ -825,7 +844,45 @@ void reshape_and_cache_flash(
-           reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),                    \
-           slot_mapping.const_data_ptr<int64_t>(), block_stride, entry_stride, \
+@@ -827,6 +846,44 @@ void reshape_and_cache_flash(
            kv_c_stride, k_pe_stride, kv_lora_rank, pe_dim, block_size,         \
--          reinterpret_cast<const float*>(scale.data_ptr()));
-+          reinterpret_cast<const float*>(scale.data_ptr()), use_ue8m0);
-+
+           reinterpret_cast<const float*>(scale.data_ptr()));
+ 
 +namespace {
 +
 +// Whether concat_and_cache_ds_mla_kernel should round its per-tile scale up to
@@ -97,9 +94,19 @@ index 2d4b47b4b..053ac1f11 100644
 +}
 +
 +}  // namespace
- 
++
  // KV_T is the data type of key and value tensors.
  // CACHE_T is the stored data type of kv-cache.
+ #define CALL_CONCAT_AND_CACHE_DS_MLA(KV_T, CACHE_T, KV_DTYPE)                 \
+@@ -837,7 +894,7 @@ void reshape_and_cache_flash(
+           reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),                    \
+           slot_mapping.const_data_ptr<int64_t>(), block_stride, entry_stride, \
+           kv_c_stride, k_pe_stride, kv_lora_rank, pe_dim, block_size,         \
+-          reinterpret_cast<const float*>(scale.data_ptr()));
++          reinterpret_cast<const float*>(scale.data_ptr()), use_ue8m0);
+ 
+ void concat_and_cache_mla(
+     torch::stable::Tensor& kv_c,      // [num_tokens, kv_lora_rank]
 @@ -892,6 +949,7 @@ void concat_and_cache_mla(
      // The RoPE part (last 64 elements) is handled by another 1 warp (32
      // threads). So in total, we use 3 warps (96 threads) per block.
