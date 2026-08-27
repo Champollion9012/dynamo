@@ -1,0 +1,367 @@
+From 7d3ec012ad8dc75d4355a98caddb4d89cca8981b Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Thu, 27 Aug 2026 04:44:52 -0700
+Subject: [PATCH] fix(kv-cache): support sparse MLA targets with SWA drafts
+
+Backport vllm-project/vllm@e18f0037a5d54dc2ead5896af896305f2bf57496 to allow A.X-K2 sparse MLA plus the sliding-window DSpark draft to share a compatible full-allocation cache layout without changing sliding-window attention compute.
+---
+ tests/v1/core/test_kv_cache_utils.py |  77 ++++++++++++-
+ vllm/v1/core/kv_cache_utils.py       | 165 ++++++++++++++++++---------
+ 2 files changed, 181 insertions(+), 61 deletions(-)
+
+diff --git a/tests/v1/core/test_kv_cache_utils.py b/tests/v1/core/test_kv_cache_utils.py
+index 6c4779ddd..3d14dcf15 100644
+--- a/tests/v1/core/test_kv_cache_utils.py
++++ b/tests/v1/core/test_kv_cache_utils.py
+@@ -3,6 +3,7 @@
+ import hashlib
+ import importlib
+ from collections.abc import Callable
++from types import SimpleNamespace
+ from typing import Any
+ 
+ import pytest
+@@ -30,6 +31,7 @@ from vllm.v1.core.kv_cache_utils import (
+     generate_scheduler_kv_cache_config,
+     get_kv_cache_capacity,
+     get_kv_cache_configs,
++    get_kv_cache_groups,
+     get_max_concurrency_for_kv_cache_config,
+     get_request_block_hasher,
+     group_and_unify_kv_cache_specs,
+@@ -1944,10 +1946,10 @@ def test_generate_scheduler_kv_cache_config():
+     )
+ 
+ 
+-def new_mla_spec(cache_dtype_str=None):
++def new_mla_spec(cache_dtype_str=None, block_size=16):
+     # head_size = kv_lora_rank(512) + qk_rope_head_dim(64) = 576
+     return MLAAttentionSpec(
+-        block_size=16,
++        block_size=block_size,
+         num_kv_heads=1,
+         head_size=576,
+         dtype=torch.float32,
+@@ -1997,6 +1999,66 @@ def test_group_and_unify_kv_cache_specs_mixed_page_size_groups():
+     assert layer_names == {"mla.0", "mla.1", "swa.0"}
+ 
+ 
++def new_indexer_mla_spec(block_size=16):
++    # Sparse-attention indexer k_cache: an MLAAttentionSpec with a much smaller
++    # page size than the main MLA attention (uint8, small head), so their pages
++    # cannot be unified.
++    return MLAAttentionSpec(
++        block_size=block_size,
++        num_kv_heads=1,
++        head_size=132,
++        dtype=torch.uint8,
++    )
++
++
++def _grouping_config():
++    return SimpleNamespace(
++        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
++        speculative_config=None,
++    )
++
++
++def test_mla_draft_prefers_standard_layout_when_pages_can_be_unified():
++    specs = {
++        "target.0.attn": new_mla_spec(),
++        "draft.0": new_sliding_window_spec(num_kv_heads=1, head_size=288),
++    }
++    assert len({spec.page_size_bytes for spec in specs.values()}) == 1
++
++    groups = get_kv_cache_groups(_grouping_config(), specs)
++
++    assert len(groups) == 2
++    assert all(
++        not isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs) for group in groups
++    )
++
++
++def test_mla_with_incompatible_swa_uses_one_full_allocation_group(caplog):
++    # Sparse MLA pages cannot be padded safely. Keeping the draft's attention
++    # compute sliding-window while promoting only its allocation semantics lets
++    # every layer share the target's block table and remain contiguous.
++    draft = new_sliding_window_spec(block_size=16)
++    specs = {
++        "target.0.attn": new_mla_spec(block_size=64),
++        "target.0.indexer": new_indexer_mla_spec(block_size=64),
++        "draft.0": draft,
++    }
++
++    groups = get_kv_cache_groups(_grouping_config(), specs)
++    assert len(groups) == 1
++    assert set(groups[0].layer_names) == set(specs)
++    group_spec = groups[0].kv_cache_spec
++    assert isinstance(group_spec, UniformTypeKVCacheSpecs)
++    assert group_spec.block_size == 64
++    promoted_draft = group_spec.kv_cache_specs["draft.0"]
++    assert isinstance(promoted_draft, FullAttentionSpec)
++    assert not isinstance(promoted_draft, SlidingWindowSpec)
++    assert promoted_draft.block_size == 64
++    assert promoted_draft.sliding_window == draft.sliding_window
++    assert specs["draft.0"] is draft
++    assert "attention compute is unchanged" in caplog.text
++
++
+ def test_get_kv_cache_spec_kind_prefers_specific_attention_subclasses():
+     assert get_kv_cache_spec_kind(new_mla_spec()) == KVCacheSpecKind.MLA_ATTENTION
+ 
+@@ -2496,19 +2558,22 @@ def test_page_size_padded_wins():
+ 
+ def test_unify_hybrid_kv_cache_specs():
+     # 1. has_full_attention and has_sliding_window
+-    before_spec_1 = new_kv_cache_spec()
++    before_spec_1 = new_kv_cache_spec(block_size=64)
+     before_spec_2 = new_sliding_window_spec(
+-        page_size_padded=32 * 1024, sliding_window=1024
++        block_size=16, page_size_padded=32 * 1024, sliding_window=1024
+     )
+     kv_cache_spec = {
+         "layer_1": before_spec_1,
+         "layer_2": before_spec_2,
+     }
+     kv_cache_utils.unify_hybrid_kv_cache_specs(kv_cache_spec)
+-    expected_spec_1 = new_kv_cache_spec()
+-    expected_spec_2 = new_kv_cache_spec(page_size_padded=32 * 1024, sliding_window=1024)
++    expected_spec_1 = new_kv_cache_spec(block_size=64)
++    expected_spec_2 = new_kv_cache_spec(
++        block_size=64, page_size_padded=64 * 1024, sliding_window=1024
++    )
+     assert kv_cache_spec["layer_1"] == expected_spec_1
+     assert kv_cache_spec["layer_2"] == expected_spec_2
++    assert kv_cache_spec["layer_2"].page_size_bytes == 64 * 1024
+ 
+     # 2. has_full_attention and has_chunked_local_attention
+     before_spec_1 = new_kv_cache_spec()
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index d4970d91b..742744d84 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -1426,100 +1426,150 @@ def get_kv_cache_config_from_groups(
+     )
+ 
+ 
+-def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
+-    """
+-    This function tries to convert the KV cache specs to one type if the model
+-    is a hybrid model with multiple type of KV cache. It will convert all
+-    SlidingWindowSpec to FullAttentionSpec if both types are present.
++def _promote_local_kv_cache_specs(
++    kv_cache_spec: dict[str, KVCacheSpec],
++) -> dict[str, KVCacheSpec]:
++    """Use full-attention allocation for local-attention cache specs.
+ 
+-    Args:
+-        kv_cache_spec: The kv cache spec of each attention layer in the model
++    The returned specs affect KV cache management only. Attention modules keep
++    their original sliding-window or chunked-local compute behavior.
+     """
++    promoted_specs = kv_cache_spec.copy()
+ 
+     if is_kv_cache_spec_uniform(
+-        kv_cache_spec
+-    ) or UniformTypeKVCacheSpecs.is_uniform_type(kv_cache_spec):
+-        return
+-
+-    logger.warning(
+-        "Hybrid KV cache manager is disabled for this hybrid model, "
+-        "This means we do not enable any optimizations for saving KV cache "
+-        "memory (e.g., dropping the KV cache outside the sliding window). "
+-        "The compute of layers like sliding window is still saved."
+-    )
++        promoted_specs
++    ) or UniformTypeKVCacheSpecs.is_uniform_type(promoted_specs):
++        return promoted_specs
+ 
+     has_full_attention = any(
+-        isinstance(spec, FullAttentionSpec) for spec in kv_cache_spec.values()
++        isinstance(spec, FullAttentionSpec) for spec in promoted_specs.values()
+     )
+     has_sliding_window = any(
+-        isinstance(spec, SlidingWindowSpec) for spec in kv_cache_spec.values()
++        isinstance(spec, SlidingWindowSpec) for spec in promoted_specs.values()
+     )
+     has_chunked_local_attention = any(
+-        isinstance(spec, ChunkedLocalAttentionSpec) for spec in kv_cache_spec.values()
++        isinstance(spec, ChunkedLocalAttentionSpec) for spec in promoted_specs.values()
+     )
+-    has_swa_mla = any(
+-        isinstance(spec, SlidingWindowMLASpec) for spec in kv_cache_spec.values()
++    full_block_sizes = {
++        spec.block_size
++        for spec in promoted_specs.values()
++        if isinstance(spec, FullAttentionSpec)
++    }
++    full_attention_block_size = (
++        next(iter(full_block_sizes)) if len(full_block_sizes) == 1 else None
+     )
+ 
+-    uniform_block_size: int | None = None
+-    if has_swa_mla:
+-        # For DeepseekV4, block sizes can be different for different KV cache groups.
+-        # E.g., Full MLA: 256; SWA MLA: 64; C4 partial states: 4, C128 states: 8.
+-        assert has_full_attention
+-        any_full_spec = next(
+-            iter(
+-                spec
+-                for spec in kv_cache_spec.values()
+-                if isinstance(spec, FullAttentionSpec)
+-            )
++    def promoted_page_size_padded(spec: AttentionSpec, block_size: int) -> int | None:
++        if spec.page_size_padded is None:
++            return None
++        unpadded_page_size = (
++            spec.unpadded_page_size_bytes * block_size // spec.block_size
+         )
+-        uniform_block_size = any_full_spec.block_size
++        return max(spec.page_size_padded, unpadded_page_size)
+ 
+     if has_full_attention and (has_sliding_window or has_chunked_local_attention):
+         for layer_name, spec in kv_cache_spec.items():
+             if isinstance(spec, SlidingWindowMLASpec):
+-                kv_cache_spec[layer_name] = MLAAttentionSpec(
+-                    block_size=uniform_block_size
+-                    if uniform_block_size is not None
+-                    else spec.block_size,
++                block_size = full_attention_block_size or spec.block_size
++                promoted_specs[layer_name] = MLAAttentionSpec(
++                    block_size=block_size,
+                     num_kv_heads=spec.num_kv_heads,
+                     head_size=spec.head_size,
+                     dtype=spec.dtype,
+-                    page_size_padded=spec.page_size_padded,
++                    page_size_padded=promoted_page_size_padded(spec, block_size),
+                     cache_dtype_str=spec.cache_dtype_str,
+                     alignment=spec.alignment,
+                     compress_ratio=spec.compress_ratio,
+                     model_version=spec.model_version,
+                 )
+             elif isinstance(spec, SlidingWindowSpec):
+-                kv_cache_spec[layer_name] = FullAttentionSpec(
+-                    block_size=spec.block_size,
++                block_size = full_attention_block_size or spec.block_size
++                promoted_specs[layer_name] = FullAttentionSpec(
++                    block_size=block_size,
+                     num_kv_heads=spec.num_kv_heads,
+                     head_size=spec.head_size,
+                     head_size_v=spec.head_size_v,
+                     dtype=spec.dtype,
+                     kv_quant_mode=spec.kv_quant_mode,
+                     sliding_window=spec.sliding_window,
+-                    page_size_padded=spec.page_size_padded,
++                    page_size_padded=promoted_page_size_padded(spec, block_size),
+                 )
+             elif isinstance(spec, ChunkedLocalAttentionSpec):
+-                kv_cache_spec[layer_name] = FullAttentionSpec(
+-                    block_size=spec.block_size,
++                block_size = full_attention_block_size or spec.block_size
++                promoted_specs[layer_name] = FullAttentionSpec(
++                    block_size=block_size,
+                     num_kv_heads=spec.num_kv_heads,
+                     head_size=spec.head_size,
+                     dtype=spec.dtype,
+                     attention_chunk_size=spec.attention_chunk_size,
+-                    page_size_padded=spec.page_size_padded,
++                    page_size_padded=promoted_page_size_padded(spec, block_size),
+                 )
+ 
+     if not (
+-        is_kv_cache_spec_uniform(kv_cache_spec)
+-        or UniformTypeKVCacheSpecs.is_uniform_type(kv_cache_spec)
++        is_kv_cache_spec_uniform(promoted_specs)
++        or UniformTypeKVCacheSpecs.is_uniform_type(promoted_specs)
+     ):
+-        raise ValueError(
+-            "Hybrid KV cache manager is disabled but failed to "
+-            "convert the KV cache specs to one unified type."
+-        )
++        raise ValueError("Failed to promote local KV cache specs to one unified type.")
++
++    return promoted_specs
++
++
++def _try_get_full_allocation_fallback_groups(
++    kv_cache_spec: dict[str, KVCacheSpec],
++) -> list[KVCacheGroupSpec] | None:
++    """Try a supported full-allocation fallback for local-attention layers."""
++    if any(isinstance(spec, HiddenStateCacheSpec) for spec in kv_cache_spec.values()):
++        return None
++    if any(
++        isinstance(spec, (SlidingWindowMLASpec, ChunkedLocalAttentionSpec))
++        for spec in kv_cache_spec.values()
++    ):
++        return None
++
++    has_mla = any(isinstance(spec, MLAAttentionSpec) for spec in kv_cache_spec.values())
++    has_regular_swa = any(
++        isinstance(spec, SlidingWindowSpec) for spec in kv_cache_spec.values()
++    )
++    if not (has_mla and has_regular_swa):
++        return None
++
++    try:
++        promoted_specs = _promote_local_kv_cache_specs(kv_cache_spec)
++    except ValueError:
++        return None
++    uniform_spec = UniformTypeKVCacheSpecs.from_specs(promoted_specs)
++    if uniform_spec is None:
++        return None
++    logger.warning(
++        "KV cache page sizes cannot be unified; treating sliding-window "
++        "layers as full attention for cache allocation. Sliding-window "
++        "attention compute is unchanged."
++    )
++    return _get_kv_cache_groups_uniform_type(uniform_spec)
++
++
++def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
++    """
++    This function tries to convert the KV cache specs to one type if the model
++    is a hybrid model with multiple type of KV cache. It will convert all
++    SlidingWindowSpec to FullAttentionSpec if both types are present.
++
++    Args:
++        kv_cache_spec: The kv cache spec of each attention layer in the model
++    """
++
++    if is_kv_cache_spec_uniform(
++        kv_cache_spec
++    ) or UniformTypeKVCacheSpecs.is_uniform_type(kv_cache_spec):
++        return
++
++    logger.warning(
++        "Hybrid KV cache manager is disabled for this hybrid model, "
++        "This means we do not enable any optimizations for saving KV cache "
++        "memory (e.g., dropping the KV cache outside the sliding window). "
++        "The compute of layers like sliding window is still saved."
++    )
++    kv_cache_spec.update(_promote_local_kv_cache_specs(kv_cache_spec))
+ 
+ 
+ def group_and_unify_kv_cache_specs(
+@@ -1776,10 +1826,15 @@ def get_kv_cache_groups(
+         if not isinstance(v, HiddenStateCacheSpec)
+     }
+ 
+-    # As KVCacheManager can only allocate memory of one size, we need to unify
+-    # the page size of the layers. For cases cannot be unified, this function
+-    # will raise an error.
+-    filtered_spec = unify_kv_cache_spec_page_size(filtered_spec)
++    # Prefer preserving each layer's cache semantics. If physical pages cannot
++    # be unified, try a supported allocation-only fallback before failing.
++    try:
++        filtered_spec = unify_kv_cache_spec_page_size(filtered_spec)
++    except NotImplementedError:
++        fallback_groups = _try_get_full_allocation_fallback_groups(kv_cache_spec)
++        if fallback_groups is None:
++            raise
++        return fallback_groups
+     groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
+ 
+     # Add hidden-state layers back with page aligned to the common page.
+-- 
+2.34.1
+

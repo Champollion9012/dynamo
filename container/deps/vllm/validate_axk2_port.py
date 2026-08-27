@@ -1,9 +1,20 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from types import SimpleNamespace
+
+import torch
+
 from vllm.model_executor.models.registry import ModelRegistry
 from vllm.transformers_utils.configs.axk2 import AXK2Config
 from vllm.transformers_utils.configs.speculators.algos import update_dspark
+from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    MLAAttentionSpec,
+    SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
+)
 
 
 def main() -> None:
@@ -45,6 +56,47 @@ def main() -> None:
     assert converted["draft_vocab_size"] == 32768
     assert converted["markov_rank"] == 256
     assert converted["dspark_bonus_anchor"] is False
+
+    # AXK2's sparse indexer, target MLA, and the DSpark SWA draft have
+    # incompatible page sizes. Verify the upstream allocation-only fallback:
+    # promote the draft cache to the target's block size without changing its
+    # sliding-window compute semantics.
+    grouping_config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+        speculative_config=None,
+    )
+    draft_spec = SlidingWindowSpec(
+        block_size=16,
+        num_kv_heads=16,
+        head_size=112,
+        dtype=torch.bfloat16,
+        sliding_window=128,
+    )
+    cache_specs = {
+        "target.0.attn": MLAAttentionSpec(
+            block_size=64,
+            num_kv_heads=1,
+            head_size=576,
+            dtype=torch.bfloat16,
+        ),
+        "target.0.indexer": MLAAttentionSpec(
+            block_size=64,
+            num_kv_heads=1,
+            head_size=132,
+            dtype=torch.uint8,
+        ),
+        "draft.0": draft_spec,
+    }
+    cache_groups = get_kv_cache_groups(grouping_config, cache_specs)
+    assert len(cache_groups) == 1
+    group_spec = cache_groups[0].kv_cache_spec
+    assert isinstance(group_spec, UniformTypeKVCacheSpecs)
+    promoted_draft = group_spec.kv_cache_specs["draft.0"]
+    assert isinstance(promoted_draft, FullAttentionSpec)
+    assert not isinstance(promoted_draft, SlidingWindowSpec)
+    assert promoted_draft.block_size == 64
+    assert promoted_draft.sliding_window == 128
+    assert cache_specs["draft.0"] is draft_spec
 
     print("AXK2_DSPARK_PORT_WIRING_OK")
 
