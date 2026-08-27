@@ -29,7 +29,8 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
+use tokio::task::AbortHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -44,6 +45,7 @@ use dynamo_runtime::transports::event_plane::MsgpackCodec;
 // Match the existing standalone replica-sync queue. Lifecycle callers enqueue without awaiting;
 // if the queue is full, the newest event is dropped without blocking the local mutation.
 const REPLICA_EVENT_CHANNEL_CAPACITY: usize = 100_000;
+const ACTIVE_LOAD_REPLAY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActiveSequenceEventWireFormat {
@@ -165,8 +167,15 @@ fn active_sequence_event_channel(
 /// Concrete [`SequencePublisher`] backed by the runtime event plane and Prometheus gauges.
 pub struct RuntimeSequencePublisher {
     event_sender: Option<ActiveSequenceEventPublisher>,
-    metrics_publisher: Arc<EventPublisher>,
+    load_tx: watch::Sender<HashMap<WorkerWithDpRank, ActiveLoad>>,
+    load_task: AbortHandle,
     worker_status_metrics: Arc<RouterWorkerStatusMetrics>,
+}
+
+impl Drop for RuntimeSequencePublisher {
+    fn drop(&mut self) {
+        self.load_task.abort();
+    }
 }
 
 impl SequencePublisher for RuntimeSequencePublisher {
@@ -178,30 +187,28 @@ impl SequencePublisher for RuntimeSequencePublisher {
     }
 
     fn publish_load(&self, load: ActiveLoad) {
-        let publisher = self.metrics_publisher.clone();
-        tokio::spawn(async move {
-            if let Err(e) = publisher.publish(&load).await {
-                tracing::trace!(
-                    "Failed to publish ActiveLoad to NATS for worker (id={}, dp_rank={}): {e:?}",
-                    load.worker_id,
-                    load.dp_rank
-                );
+        let worker = WorkerWithDpRank::new(load.worker_id, load.dp_rank);
+        self.load_tx.send_if_modified(|latest| {
+            if latest.get(&worker) == Some(&load) {
+                false
+            } else {
+                latest.insert(worker, load);
+                true
             }
         });
     }
 
     fn publish_load_batch(&self, loads: Vec<ActiveLoad>) {
-        let publisher = self.metrics_publisher.clone();
-        tokio::spawn(async move {
+        self.load_tx.send_if_modified(|latest| {
+            let mut changed = false;
             for load in loads {
-                if let Err(e) = publisher.publish(&load).await {
-                    tracing::trace!(
-                        "Failed to publish ActiveLoad to NATS for worker (id={}, dp_rank={}): {e:?}",
-                        load.worker_id,
-                        load.dp_rank
-                    );
+                let worker = WorkerWithDpRank::new(load.worker_id, load.dp_rank);
+                if latest.get(&worker) != Some(&load) {
+                    latest.insert(worker, load);
+                    changed = true;
                 }
             }
+            changed
         });
     }
 
@@ -222,14 +229,82 @@ impl SequencePublisher for RuntimeSequencePublisher {
     }
 
     fn observe_worker_registered(&self, worker: &WorkerWithDpRank, worker_type: &str) {
+        self.publish_load(ActiveLoad {
+            worker_id: worker.worker_id,
+            dp_rank: worker.dp_rank,
+            active_decode_blocks: Some(0),
+            active_prefill_tokens: Some(0),
+            kv_used_blocks: None,
+        });
         self.worker_status_metrics
             .set_registered(worker.worker_id, worker.dp_rank, worker_type);
     }
 
     fn observe_worker_removed(&self, worker: &WorkerWithDpRank, worker_type: &str) {
+        self.load_tx
+            .send_if_modified(|latest| latest.remove(worker).is_some());
         self.worker_status_metrics
             .remove_worker(worker.worker_id, worker.dp_rank, worker_type);
     }
+}
+
+async fn run_active_load_publisher(
+    publisher: EventPublisher,
+    mut load_rx: watch::Receiver<HashMap<WorkerWithDpRank, ActiveLoad>>,
+    cancellation_token: CancellationToken,
+) {
+    let mut published = HashMap::<WorkerWithDpRank, ActiveLoad>::new();
+    let mut replay = tokio::time::interval_at(
+        Instant::now() + ACTIVE_LOAD_REPLAY_INTERVAL,
+        ACTIVE_LOAD_REPLAY_INTERVAL,
+    );
+    replay.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        let replay_all = tokio::select! {
+            _ = cancellation_token.cancelled() => return,
+            changed = load_rx.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                false
+            }
+            _ = replay.tick() => true,
+        };
+        let pending =
+            pending_active_loads(&load_rx.borrow_and_update(), &mut published, replay_all);
+        for (worker, load) in pending {
+            let result = tokio::select! {
+                _ = cancellation_token.cancelled() => return,
+                result = publisher.publish(&load) => result,
+            };
+            match result {
+                Ok(()) => {
+                    published.insert(worker, load);
+                }
+                Err(error) => tracing::trace!(
+                    worker_id = worker.worker_id,
+                    dp_rank = worker.dp_rank,
+                    %error,
+                    "Failed to publish scheduler ActiveLoad"
+                ),
+            }
+        }
+    }
+}
+
+fn pending_active_loads(
+    latest: &HashMap<WorkerWithDpRank, ActiveLoad>,
+    published: &mut HashMap<WorkerWithDpRank, ActiveLoad>,
+    replay_all: bool,
+) -> Vec<(WorkerWithDpRank, ActiveLoad)> {
+    let removed = published.keys().any(|worker| !latest.contains_key(worker));
+    published.retain(|worker, _| latest.contains_key(worker));
+    latest
+        .iter()
+        .filter(|(worker, load)| replay_all || removed || published.get(*worker) != Some(*load))
+        .map(|(worker, load)| (*worker, load.clone()))
+        .collect()
 }
 
 trait SingletonEventPublisher: Send + Sync {
@@ -477,13 +552,20 @@ pub async fn create_multi_worker_sequences(
     } else {
         None
     };
-    let metrics_publisher =
-        Arc::new(EventPublisher::for_endpoint(&endpoint, KV_METRICS_SUBJECT).await?);
+    let metrics_publisher = EventPublisher::for_endpoint(&endpoint, KV_METRICS_SUBJECT).await?;
+    let (load_tx, load_rx) = watch::channel(HashMap::new());
+    let load_task = tokio::spawn(run_active_load_publisher(
+        metrics_publisher,
+        load_rx,
+        cancellation_token.child_token(),
+    ))
+    .abort_handle();
     let worker_status_metrics = RouterWorkerStatusMetrics::from_component(endpoint.component());
 
     let publisher = RuntimeSequencePublisher {
         event_sender,
-        metrics_publisher,
+        load_tx,
+        load_task,
         worker_status_metrics,
     };
 
@@ -588,6 +670,30 @@ mod tests {
             router_id: 7,
             lora_name: None,
         }
+    }
+
+    fn active_load(worker_id: u64, blocks: u64) -> ActiveLoad {
+        ActiveLoad {
+            worker_id,
+            active_decode_blocks: Some(blocks),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn active_load_removal_republishes_the_remaining_topology() {
+        let removed = WorkerWithDpRank::new(1, 0);
+        let retained = WorkerWithDpRank::new(2, 0);
+        let mut published = HashMap::from([
+            (removed, active_load(1, 10)),
+            (retained, active_load(2, 20)),
+        ]);
+        let latest = HashMap::from([(retained, active_load(2, 20))]);
+
+        let pending = pending_active_loads(&latest, &mut published, false);
+
+        assert_eq!(pending, [(retained, active_load(2, 20))]);
+        assert!(!published.contains_key(&removed));
     }
 
     struct BlockingSingletonPublisher {

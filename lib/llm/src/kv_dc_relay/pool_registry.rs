@@ -149,20 +149,17 @@ pub(super) struct PoolRegistry {
     ckf_allocation_permits: Arc<Semaphore>,
     state: Mutex<PoolRegistryState>,
     catalog_tx: watch::Sender<DcPoolCatalog>,
-    load_tx: watch::Sender<Vec<PoolLoadSnapshot>>,
 }
 
 impl PoolRegistry {
     pub(super) fn new(relay_identity: DcRelayIdentity, actor_config: PoolActorConfig) -> Self {
         let (catalog_tx, _) = watch::channel(DcPoolCatalog::new(relay_identity, 0, Vec::new()));
-        let (load_tx, _) = watch::channel(Vec::new());
         Self {
             relay_identity,
             actor_config,
             ckf_allocation_permits: Arc::new(Semaphore::new(DEFAULT_CKF_ALLOCATION_CONCURRENCY)),
             state: Mutex::new(PoolRegistryState::default()),
             catalog_tx,
-            load_tx,
         }
     }
 
@@ -308,9 +305,6 @@ impl PoolRegistry {
             },
         );
         publish_catalog_upsert(&mut state, &self.catalog_tx, descriptor);
-        {
-            publish_load_if_changed(&state, &self.load_tx, request.pool_id);
-        }
         reservation.disarm();
 
         Ok(PoolAttachment {
@@ -432,24 +426,10 @@ impl PoolRegistry {
         let Some(serving) = entry.serving.as_mut() else {
             return Ok(false);
         };
-        let capacity_update = serving.load.replace_capacity(runtime_configs);
-        match capacity_update {
-            Ok(changed) => {
-                if changed {
-                    publish_load_if_changed(&state, &self.load_tx, pool_id);
-                }
-                // The caller uses true to record that this active generation accepted
-                // the full runtime config, including fields outside the load contract.
-                Ok(true)
-            }
-            Err(error) => {
-                // replace_capacity invalidates state before returning an error. Publish
-                // that degraded state immediately so the previous complete snapshot
-                // cannot remain authoritative while the caller retries metadata refresh.
-                publish_load_if_changed(&state, &self.load_tx, pool_id);
-                Err(error)
-            }
-        }
+        serving.load.replace_capacity(runtime_configs)?;
+        // The caller uses true to record that this active generation accepted
+        // the full runtime config, including fields outside the load contract.
+        Ok(true)
     }
 
     pub(super) fn observe_load(
@@ -472,10 +452,7 @@ impl PoolRegistry {
         match serving.load.observe(envelope, load) {
             LoadObservationOutcome::UnknownRank => false,
             LoadObservationOutcome::IgnoredStale => true,
-            LoadObservationOutcome::Updated => {
-                publish_load_if_changed(&state, &self.load_tx, pool_id);
-                true
-            }
+            LoadObservationOutcome::Updated => true,
         }
     }
 
@@ -490,9 +467,7 @@ impl PoolRegistry {
         let Some(serving) = entry.serving.as_mut() else {
             return false;
         };
-        if serving.load.clear_observations() {
-            publish_load_if_changed(&state, &self.load_tx, pool_id);
-        }
+        serving.load.clear_observations();
         true
     }
 
@@ -517,7 +492,6 @@ impl PoolRegistry {
         entry.cancel.cancel();
         if was_active {
             publish_catalog_remove(&mut state, &self.catalog_tx, pool_id);
-            publish_load_if_changed(&state, &self.load_tx, pool_id);
         }
         true
     }
@@ -538,9 +512,6 @@ impl PoolRegistry {
             entry.cancel.cancel();
             if was_active {
                 publish_catalog_remove(&mut state, &self.catalog_tx, pool_id);
-            }
-            {
-                publish_load_if_changed(&state, &self.load_tx, pool_id);
             }
             entry
         };
@@ -582,10 +553,6 @@ impl PoolRegistry {
         snapshots
     }
 
-    pub(super) fn watch_load(&self) -> watch::Receiver<Vec<PoolLoadSnapshot>> {
-        self.load_tx.subscribe()
-    }
-
     pub(super) async fn shutdown(&self) {
         let entries = {
             let mut state = self.state.lock();
@@ -594,15 +561,6 @@ impl PoolRegistry {
             state.reservations.clear();
             let entries = state.pools.drain().collect::<Vec<_>>();
             publish_catalog_clear(&mut state, &self.catalog_tx);
-            {
-                self.load_tx.send_if_modified(|snapshots| {
-                    if snapshots.is_empty() {
-                        return false;
-                    }
-                    snapshots.clear();
-                    true
-                });
-            }
             entries
         };
         for (pool_id, entry) in entries {
@@ -715,43 +673,6 @@ fn publish_catalog_remove(
 fn publish_catalog_clear(state: &mut PoolRegistryState, sender: &watch::Sender<DcPoolCatalog>) {
     let revision = advance_catalog_revision(state);
     sender.send_modify(|catalog| catalog.clear(revision));
-}
-
-fn publish_load_if_changed(
-    state: &PoolRegistryState,
-    sender: &watch::Sender<Vec<PoolLoadSnapshot>>,
-    pool_id: PoolId,
-) {
-    let snapshot = state
-        .pools
-        .get(&pool_id)
-        .filter(|entry| entry.state == PoolEntryState::Active)
-        .and_then(|entry| {
-            entry
-                .serving
-                .as_ref()
-                .map(|serving| serving.load.snapshot(entry.identity, Instant::now()))
-        });
-    sender.send_if_modified(|snapshots| {
-        match (
-            snapshots.binary_search_by_key(&pool_id, |item| item.producer.pool_id()),
-            snapshot,
-        ) {
-            (Ok(index), Some(snapshot)) if snapshots[index] != snapshot => {
-                snapshots[index] = snapshot;
-                true
-            }
-            (Ok(index), None) => {
-                snapshots.remove(index);
-                true
-            }
-            (Err(index), Some(snapshot)) => {
-                snapshots.insert(index, snapshot);
-                true
-            }
-            _ => false,
-        }
-    });
 }
 
 fn validate_registrations(registrations: &[CanonicalModelRegistration]) -> anyhow::Result<()> {
@@ -1582,7 +1503,7 @@ mod tests {
         assert_eq!(snapshots[0].kv_used_blocks, None);
         assert_eq!(snapshots[0].total_kv_blocks, None);
         assert_eq!(snapshots[0].kv_expected_ranks, 0);
-        assert!(snapshots[0].has_degraded_coverage());
+        assert!(snapshots[0].has_degraded_kv_coverage());
 
         registry.detach(attachment).await.unwrap();
     }
@@ -1601,8 +1522,6 @@ mod tests {
             )]),
         });
         let attachment = registry.attach(attach_request).await.unwrap();
-        let mut load_watch = registry.watch_load();
-        assert!(!load_watch.has_changed().unwrap());
 
         assert!(registry.observe_load(
             attachment.pool_id,
@@ -1620,8 +1539,6 @@ mod tests {
         let snapshot = registry.load_snapshots()[0];
         assert_eq!(snapshot.active_decode_blocks, Some(30));
         assert_eq!(snapshot.active_prefill_tokens, Some(512));
-        assert!(load_watch.has_changed().unwrap());
-        load_watch.borrow_and_update();
         registry.detach(attachment).await.unwrap();
     }
 
@@ -1650,8 +1567,7 @@ mod tests {
                 ..ActiveLoad::default()
             },
         ));
-        assert!(!registry.load_snapshots()[0].has_degraded_coverage());
-        let mut load_watch = registry.watch_load();
+        assert!(!registry.load_snapshots()[0].has_degraded_kv_coverage());
 
         let error = registry
             .replace_load_capacity(
@@ -1668,14 +1584,13 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.to_string().contains("zero data_parallel_size"));
-        assert!(load_watch.has_changed().unwrap());
 
-        let snapshots = load_watch.borrow_and_update().clone();
+        let snapshots = registry.load_snapshots();
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].kv_used_blocks, None);
         assert_eq!(snapshots[0].total_kv_blocks, None);
         assert_eq!(snapshots[0].kv_expected_ranks, 0);
-        assert!(snapshots[0].has_degraded_coverage());
+        assert!(snapshots[0].has_degraded_kv_coverage());
         assert_eq!(registry.catalog().pools().len(), 1);
 
         registry.detach(attachment).await.unwrap();
@@ -1712,7 +1627,7 @@ mod tests {
         assert_eq!(initial_load[0].kv_observed_ranks, 0);
         assert_eq!(initial_load[0].kv_used_blocks, None);
         assert_eq!(initial_load[0].total_kv_blocks, Some(100));
-        assert!(initial_load[0].has_degraded_coverage());
+        assert!(initial_load[0].has_degraded_kv_coverage());
 
         let mut load = ActiveLoad {
             worker_id: 1,
@@ -1726,7 +1641,7 @@ mod tests {
         let observed = registry.load_snapshots()[0];
         assert_eq!(observed.kv_used_blocks, Some(40));
         assert_eq!(observed.total_kv_blocks, Some(100));
-        assert!(!observed.has_degraded_coverage());
+        assert!(!observed.has_degraded_kv_coverage());
 
         assert!(
             registry

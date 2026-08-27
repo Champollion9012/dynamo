@@ -45,14 +45,11 @@ const DEFAULT_PUBLICATION_DELAY: Duration = Duration::from_millis(1);
 const RECOVERY_REBUILD_BATCH_WINDOW: Duration = Duration::from_millis(5);
 
 #[derive(Debug)]
-// NOTE: This is the intentional producer snapshot/delta seam for the future non-local adapter.
-// It remains crate-private until that transport has delivery cursors and recovery semantics.
-#[allow(dead_code)]
-pub(crate) struct DcCkfSubscription {
-    pub(crate) snapshot: DcCkfSnapshot,
-    pub(crate) deltas: broadcast::Receiver<DcCkfDelta>,
-    pub(crate) stats: DcCkfStats,
-    pub(crate) members: Vec<(WorkerWithDpRank, usize)>,
+pub(super) struct DcCkfSubscription {
+    pub(super) snapshot: DcCkfSnapshot,
+    pub(super) deltas: broadcast::Receiver<DcCkfDelta>,
+    pub(super) stats: DcCkfStats,
+    pub(super) members: Vec<(WorkerWithDpRank, usize)>,
 }
 
 // NOTE: `dynamo-llm` enables the router's general metrics feature in production. Keep these
@@ -539,9 +536,7 @@ impl KvDcRelayHandle {
             .await
     }
 
-    // Kept with `DcCkfSubscription` as the crate-private producer boundary described above.
-    #[allow(dead_code)]
-    pub(crate) async fn subscribe(
+    pub(super) async fn subscribe(
         &self,
         lease: LaneLease,
     ) -> Result<DcCkfSubscription, KvDcRelayError> {

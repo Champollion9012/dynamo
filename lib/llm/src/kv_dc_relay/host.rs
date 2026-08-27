@@ -416,7 +416,7 @@ impl EndpointAvailabilityWatch {
 }
 
 #[derive(Default)]
-struct HostTerminalState {
+pub(super) struct HostTerminalState {
     last_error: Mutex<Option<String>>,
 }
 
@@ -662,7 +662,8 @@ impl KvDcRelay {
                     statuses.clone(),
                     pools.clone(),
                     listen_address,
-                    cancel.child_token(),
+                    cancel.clone(),
+                    terminal.clone(),
                 )
                 .await?,
             )
@@ -729,10 +730,6 @@ impl KvDcRelay {
     /// remains `None` until all declared ranks have supplied the corresponding data.
     pub fn pool_load(&self) -> Vec<PoolLoadSnapshot> {
         self.pools.load_snapshots()
-    }
-
-    pub fn watch_pool_load(&self) -> watch::Receiver<Vec<PoolLoadSnapshot>> {
-        self.pools.watch_load()
     }
 
     #[cfg(feature = "ckf-diagnostics")]
@@ -1101,7 +1098,11 @@ fn spawn_host_task_supervisor(
     })
 }
 
-fn record_host_failure(cancel: &CancellationToken, terminal: &HostTerminalState, reason: String) {
+pub(super) fn record_host_failure(
+    cancel: &CancellationToken,
+    terminal: &HostTerminalState,
+    reason: String,
+) {
     tracing::error!(error = %reason, "KV DC Relay host failed");
     terminal.record(reason);
     cancel.cancel();
@@ -1801,7 +1802,10 @@ async fn instance_availability_watch(
 }
 
 async fn diagnostic_tick() {
+    #[cfg(feature = "ckf-diagnostics")]
     tokio::time::sleep(Duration::from_secs(1)).await;
+    #[cfg(not(feature = "ckf-diagnostics"))]
+    std::future::pending::<()>().await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2061,8 +2065,14 @@ async fn run_load_collector(
 ) {
     let mut retry = LoadRetryBackoff::default();
     loop {
-        let subscriber =
-            EventSubscriber::for_endpoint_id(component.drt(), &endpoint, KV_METRICS_SUBJECT).await;
+        let subscriber = tokio::select! {
+            _ = cancel.cancelled() => return,
+            subscriber = EventSubscriber::for_endpoint_id(
+                component.drt(),
+                &endpoint,
+                KV_METRICS_SUBJECT,
+            ) => subscriber,
+        };
         let mut subscriber = match subscriber {
             Ok(subscriber) => subscriber.typed::<ActiveLoad>(),
             Err(error) => {
