@@ -5,7 +5,7 @@ use std::collections::HashSet;
 
 use anyhow::Result;
 use dynamo_kv_router::conditional_disagg::ConditionalDisaggDecisionInput;
-use dynamo_kv_router::protocols::WorkerWithDpRank;
+use dynamo_kv_router::protocols::{WorkerAffinityTarget, WorkerWithDpRank};
 use dynamo_kv_router::selector::WorkerSelector;
 use dynamo_runtime::pipeline::{Context, SingleIn};
 
@@ -18,7 +18,7 @@ use crate::protocols::common::{
     preprocessor::RoutingHints,
     timing::RequestPhase,
 };
-use crate::session_affinity::AffinityTarget;
+use crate::session_affinity::{AffinityTarget, SessionAffinityMode};
 
 /// Conditional-disagg decision: which decode worker to pin the request to,
 /// plus diagnostic counts for logging.
@@ -152,8 +152,13 @@ where
                 return Ok(None);
             }
         };
-        let pinned_worker = match request_pinned_worker {
-            Some(worker) => Some(worker),
+        let (pinned_worker, affinity_target) = match request_pinned_worker {
+            Some(worker) => (Some(worker), None),
+            None if self.session_affinity_mode == SessionAffinityMode::Soft => (
+                None,
+                decode_affinity_target
+                    .map(|target| WorkerAffinityTarget::new(target.worker_id, target.dp_rank)),
+            ),
             None => match decode_affinity_target {
                 Some(target) => {
                     let Some(dp_rank) = target
@@ -167,9 +172,9 @@ where
                         );
                         return Ok(None);
                     };
-                    Some(WorkerWithDpRank::new(target.worker_id, dp_rank))
+                    (Some(WorkerWithDpRank::new(target.worker_id, dp_rank)), None)
                 }
-                None => None,
+                None => (None, None),
             },
         };
         let routing_constraints = req
@@ -192,6 +197,7 @@ where
                 policy_class.clone(),
                 session_context,
                 expected_output_tokens,
+                affinity_target,
                 pinned_worker,
                 allowed_worker_ids,
                 routing_constraints,
@@ -352,21 +358,32 @@ where
             .query_affinity_target(&probe_context, RequestPhase::Prefill)
             .ok()
             .flatten();
-        if let Some(AffinityTarget {
-            worker_id,
-            dp_rank: None,
-        }) = affinity_target
+        if self.session_affinity_mode == SessionAffinityMode::Hard
+            && let Some(AffinityTarget {
+                worker_id,
+                dp_rank: None,
+            }) = affinity_target
         {
             match &mut allowed_worker_ids {
                 Some(allowed_workers) => allowed_workers.retain(|id| *id == worker_id),
                 None => allowed_worker_ids = Some(HashSet::from([worker_id])),
             }
         }
-        let pinned_worker = affinity_target.and_then(|target| {
-            target
-                .dp_rank
-                .map(|dp_rank| WorkerWithDpRank::new(target.worker_id, dp_rank))
-        });
+        let pinned_worker = (self.session_affinity_mode == SessionAffinityMode::Hard)
+            .then(|| {
+                affinity_target.and_then(|target| {
+                    target
+                        .dp_rank
+                        .map(|dp_rank| WorkerWithDpRank::new(target.worker_id, dp_rank))
+                })
+            })
+            .flatten();
+        let affinity_target = (self.session_affinity_mode == SessionAffinityMode::Soft)
+            .then(|| {
+                affinity_target
+                    .map(|target| WorkerAffinityTarget::new(target.worker_id, target.dp_rank))
+            })
+            .flatten();
 
         let outcome = kv_router
             .find_best_match_details_without_admission(
@@ -384,6 +401,7 @@ where
                     .as_ref()
                     .map(to_worker_selection_session_context),
                 expected_output_tokens,
+                affinity_target,
                 pinned_worker,
                 allowed_worker_ids,
                 routing_constraints,

@@ -12,7 +12,7 @@ where
         request: &SingleIn<PreprocessedRequest>,
         phase: RequestPhase,
         is_query_only: bool,
-        affinity_target: Option<AffinityTarget>,
+        session_target: Option<AffinityTarget>,
     ) -> Result<WorkerSelection, Error> {
         let context_id = request.context().id().to_string();
         let policy_class = request.metadata().get("policy-class").cloned();
@@ -30,7 +30,14 @@ where
                 phase,
                 is_query_only,
                 SelectionOptions {
-                    affinity_target,
+                    pinned_target: match self.session_affinity_mode {
+                        SessionAffinityMode::Hard => session_target,
+                        SessionAffinityMode::Soft => None,
+                    },
+                    affinity_target: match self.session_affinity_mode {
+                        SessionAffinityMode::Hard => None,
+                        SessionAffinityMode::Soft => session_target,
+                    },
                     policy_class,
                     session_context,
                 },
@@ -278,17 +285,13 @@ where
             .await
         {
             Ok(guard) => guard,
-            Err(error) => {
-                invalidate_on_non_cancellation(&mut operation, &error);
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
         let selected_target = route_target(selection.worker);
         let metadata = match prepare(&mut request, selected_target) {
             Ok(metadata) => metadata,
             Err(error) => {
                 guard.abort().await;
-                invalidate_on_non_cancellation(&mut operation, &error);
                 return Err(error);
             }
         };
@@ -296,13 +299,21 @@ where
         let stream = match self.dispatch_selection(request, selection, guard).await {
             Ok(stream) => stream,
             Err(error) => {
-                invalidate_on_non_cancellation(&mut operation, &error);
+                if self.session_affinity_mode == SessionAffinityMode::Hard
+                    && !self.affinity_target_is_routable(selected_target)
+                    && let Some(operation) = operation.take()
+                {
+                    operation.invalidate();
+                }
                 return Err(error);
             }
         };
         let Some(operation) = operation else {
             return Ok((metadata, stream));
         };
-        Ok((metadata, operation.into_stream(selected_target, stream)?))
+        Ok((
+            metadata,
+            self.track_session_affinity(operation, selected_target, stream)?,
+        ))
     }
 }
