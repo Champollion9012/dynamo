@@ -19,6 +19,7 @@ from pathlib import Path
 
 import torch
 import vllm
+import vllm._flashmla_C  # noqa: F401
 
 
 def native_library() -> Path:
@@ -29,6 +30,9 @@ def native_library() -> Path:
 
 
 def validate_static() -> Path:
+    assert vllm.__version__ == "0.26.0", vllm.__version__
+    assert torch.__version__ == "2.11.0+cu130", torch.__version__
+    assert torch.version.cuda == "13.0", torch.version.cuda
     library = native_library()
     marker = b"VLLM_DS_MLA_UE8M0_SCALE"
     assert marker in library.read_bytes(), f"{marker!r} is absent from {library}"

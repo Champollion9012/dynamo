@@ -5,8 +5,8 @@
 # Build a complete vLLM wheel so the fp8_ds_mla CUDA writer and its Python
 # sources come from one exact source revision.  The normal Dynamo vLLM runtime
 # recipe only overlays Python patches and therefore cannot carry this fix.
-ARG VLLM_RUNTIME_IMAGE=vllm/vllm-openai:v0.26.0-ubuntu2404
-ARG DYNAMO_AXK2_IMAGE=nvcr.io/nvstaging/nim/ax-k2-nvfp4:dynamo-1.4.1-vllm0.26.0-dspark
+ARG VLLM_RUNTIME_IMAGE=vllm/vllm-openai:v0.26.0-ubuntu2404@sha256:ef7bfc14df9233e3e5d41e733e3be0afa6abbe5ae5f14ee0758110030f6cd53e
+ARG DYNAMO_AXK2_IMAGE=nvcr.io/nvstaging/nim/ax-k2-nvfp4:dynamo-1.4.1-vllm0.26.0-dspark@sha256:edf99463e04d405a3e58568893fe811c4e66156680b38574df559fd5b4f4398b
 
 FROM ${VLLM_RUNTIME_IMAGE} AS vllm_native_builder
 
@@ -74,17 +74,18 @@ FROM ${DYNAMO_AXK2_IMAGE} AS runtime
 ARG VLLM_SOURCE_COMMIT=568afb3a13806beb53bb2e6bd518269357b237c0
 LABEL org.opencontainers.image.vllm.source="https://github.com/vllm-project/vllm" \
       org.opencontainers.image.vllm.revision="${VLLM_SOURCE_COMMIT}" \
-      org.opencontainers.image.vllm.axk2.fp8_ds_mla_ue8m0="true"
+      org.opencontainers.image.vllm.axk2.fp8_ds_mla_ue8m0="true" \
+      org.opencontainers.image.vllm.cuda_arch="sm_100"
 
 USER root
-COPY --from=vllm_native_builder /wheelhouse/vllm-0.26.0-*.whl /tmp/vllm-native/
 COPY --chmod=755 container/deps/vllm/validate_axk2_port.py /tmp/validate_axk2_port.py
 COPY --chmod=755 container/deps/vllm/validate_fp8_ds_mla_native.py /usr/local/bin/validate_fp8_ds_mla_native
-RUN set -eux; \
+RUN --mount=type=bind,from=vllm_native_builder,source=/wheelhouse,target=/tmp/vllm-native,ro \
+    set -eux; \
     python3 -m pip install --no-cache-dir --force-reinstall --no-deps \
         /tmp/vllm-native/vllm-0.26.0-*.whl; \
     python3 /tmp/validate_axk2_port.py; \
     validate_fp8_ds_mla_native; \
-    rm -rf /tmp/vllm-native /tmp/validate_axk2_port.py
+    rm -f /tmp/validate_axk2_port.py
 
 USER dynamo
