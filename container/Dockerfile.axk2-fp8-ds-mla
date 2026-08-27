@@ -65,6 +65,7 @@ ENV VLLM_TARGET_DEVICE=cuda \
     CMAKE_BUILD_TYPE=Release
 RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     --mount=type=cache,target=/src/vllm/.deps,sharing=locked \
+    --mount=type=cache,target=/src/vllm/build,sharing=locked \
     TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}" \
     MAX_JOBS="${MAX_JOBS}" \
     NVCC_THREADS="${NVCC_THREADS}" \
