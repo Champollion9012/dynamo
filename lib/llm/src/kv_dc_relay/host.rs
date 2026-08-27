@@ -29,7 +29,6 @@ use dynamo_kv_router::indexer::cuckoo::CkfFailureAction;
 use dynamo_kv_router::protocols::ActiveLoad;
 use dynamo_kv_router::protocols::{DpRank, KvCacheEventError, WorkerId};
 use dynamo_runtime::component::{Client, Component, Instance};
-use dynamo_runtime::pipeline::WorkerLoadMonitor;
 use dynamo_runtime::protocols::EndpointId;
 use dynamo_runtime::traits::DistributedRuntimeProvider;
 use parking_lot::Mutex;
@@ -56,7 +55,6 @@ use super::stats::RelayStatsRuntime;
 use super::topology::{TopologyPublisher, TopologySnapshot};
 use crate::discovery::{
     KvSourceMembershipCoordinator, KvSourceMembershipView, KvSourceMembershipWatch,
-    KvWorkerMonitor, LoadThresholdConfig,
 };
 use crate::kv_router::KV_METRICS_SUBJECT;
 #[cfg(feature = "ckf-diagnostics")]
@@ -327,7 +325,6 @@ pub(super) struct EndpointSlotStatus {
     pub(super) layout_generation: u64,
     pub(super) membership: Option<EndpointMembership>,
     pub(super) actor: Option<KvDcRelayHandle>,
-    pub(super) worker_monitor: Option<KvWorkerMonitor>,
     #[cfg(test)]
     settled_membership_generation: Option<u64>,
     #[cfg(feature = "ckf-diagnostics")]
@@ -341,7 +338,6 @@ impl Default for EndpointSlotStatus {
             layout_generation: 0,
             membership: None,
             actor: None,
-            worker_monitor: None,
             #[cfg(test)]
             settled_membership_generation: None,
             #[cfg(feature = "ckf-diagnostics")]
@@ -658,7 +654,6 @@ impl KvDcRelay {
             Arc::new(TopologyPublisher::new(initial_view, &pools.catalog()))
         };
         let terminal = Arc::new(HostTerminalState::default());
-        let stats_enabled = config.producer.grpc_listen_address.is_some();
         let stats = if let Some(listen_address) = config.producer.grpc_listen_address {
             Some(
                 RelayStatsRuntime::start(
@@ -681,7 +676,6 @@ impl KvDcRelay {
             statuses.clone(),
             pools.clone(),
             Duration::from_millis(config.producer.recovery_attempt_timeout_ms),
-            stats_enabled,
             cancel.child_token(),
             cancel.clone(),
             terminal.clone(),
@@ -889,7 +883,6 @@ async fn run_host_supervisor(
     statuses: Arc<RwLock<HashMap<EndpointId, SharedEndpointStatus>>>,
     pools: Arc<PoolRegistry>,
     recovery_attempt_timeout: Duration,
-    stats_enabled: bool,
     cancel: CancellationToken,
     fatal_cancel: CancellationToken,
     terminal: Arc<HostTerminalState>,
@@ -936,7 +929,6 @@ async fn run_host_supervisor(
                         recovery_fetch_permit.clone(),
                         pools.clone(),
                         recovery_attempt_timeout,
-                        stats_enabled,
                         slot_cancel.clone(),
                         slot_incarnation,
                         topology.clone(),
@@ -1282,7 +1274,6 @@ async fn run_endpoint_slot(
     recovery_fetch_permit: Arc<Semaphore>,
     pools: Arc<PoolRegistry>,
     recovery_attempt_timeout: Duration,
-    stats_enabled: bool,
     cancel: CancellationToken,
     slot_incarnation: u64,
     topology: Arc<TopologyPublisher>,
@@ -1299,22 +1290,9 @@ async fn run_endpoint_slot(
     let mut registration_refresh_failures = 0u64;
     let mut role_refresh_failures = 0u64;
     let mut pending_faults = PendingActorFaults::default();
-    let mut worker_monitor: Option<KvWorkerMonitor> = None;
 
     loop {
         let membership = metadata_rx.borrow_and_update().clone();
-        if !stats_enabled || membership.is_none() {
-            worker_monitor = None;
-        } else if worker_monitor.is_none() {
-            match start_worker_monitor(&component, &endpoint, cancel.child_token()).await {
-                Ok(monitor) => worker_monitor = Some(monitor),
-                Err(error) => tracing::warn!(
-                    %endpoint,
-                    %error,
-                    "KV DC Relay worker load monitor is unavailable; retrying"
-                ),
-            }
-        }
         #[cfg(test)]
         let membership_generation = membership.as_ref().map(|membership| membership.generation);
         {
@@ -1325,7 +1303,6 @@ async fn run_endpoint_slot(
             }
             current.membership = membership.clone();
             current.layout_generation = layout_generation;
-            current.worker_monitor.clone_from(&worker_monitor);
             if runtime.is_none() {
                 current.lifecycle = inactive_slot_lifecycle(membership.as_ref());
             }
@@ -1422,7 +1399,6 @@ async fn run_endpoint_slot(
                 }
                 let mut current = status.write().await;
                 current.lifecycle = SlotLifecycle::Lightweight;
-                current.worker_monitor = None;
                 #[cfg(feature = "ckf-diagnostics")]
                 {
                     current.recovery = WorkerQueryHealthSnapshot::default();
@@ -1795,7 +1771,6 @@ async fn run_endpoint_slot(
     }
     let mut current = status.write().await;
     current.actor = None;
-    current.worker_monitor = None;
     current.lifecycle = SlotLifecycle::Lightweight;
 }
 
@@ -1827,22 +1802,6 @@ async fn instance_availability_watch(
 
 async fn diagnostic_tick() {
     tokio::time::sleep(Duration::from_secs(1)).await;
-}
-
-async fn start_worker_monitor(
-    component: &Component,
-    endpoint_id: &EndpointId,
-    cancel: CancellationToken,
-) -> anyhow::Result<KvWorkerMonitor> {
-    let endpoint = component
-        .drt()
-        .namespace(&endpoint_id.namespace)?
-        .component(&endpoint_id.component)?
-        .endpoint(&endpoint_id.name);
-    let client = endpoint.client_with_cancellation(cancel).await?;
-    let monitor = KvWorkerMonitor::new(client, LoadThresholdConfig::default());
-    monitor.start_monitoring().await?;
-    Ok(monitor)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2126,9 +2085,9 @@ async fn run_load_collector(
                 event = subscriber.next() => event,
             };
             match event {
-                Some(Ok((_envelope, load))) => {
+                Some(Ok((envelope, load))) => {
                     retry.succeeded();
-                    if !pools.observe_load(pool_id, layout_generation, load) {
+                    if !pools.observe_load(pool_id, layout_generation, &envelope, load) {
                         tracing::debug!(%endpoint, %pool_id, layout_generation, "Ignoring ActiveLoad outside the pool generation's expected ranks");
                     }
                 }
@@ -3322,7 +3281,6 @@ mod tests {
             Arc::new(Semaphore::new(1)),
             registry.clone(),
             Duration::from_secs(1),
-            false,
             slot_cancel.clone(),
             1,
             topology,
@@ -3417,7 +3375,6 @@ mod tests {
             Arc::new(Semaphore::new(1)),
             registry.clone(),
             Duration::from_secs(1),
-            false,
             slot_cancel.clone(),
             1,
             topology,
@@ -3532,7 +3489,6 @@ mod tests {
             Arc::new(Semaphore::new(1)),
             registry.clone(),
             Duration::from_secs(1),
-            false,
             slot_cancel.clone(),
             1,
             topology,
@@ -3626,7 +3582,6 @@ mod tests {
             recovery_fetch_permit.clone(),
             registry.clone(),
             Duration::from_secs(1),
-            false,
             prefill_cancel.clone(),
             1,
             topology.clone(),
@@ -3641,7 +3596,6 @@ mod tests {
             recovery_fetch_permit,
             registry.clone(),
             Duration::from_secs(1),
-            false,
             decode_cancel.clone(),
             2,
             topology,

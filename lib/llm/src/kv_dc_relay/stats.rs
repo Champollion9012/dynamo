@@ -28,6 +28,7 @@ use super::host::{SharedEndpointStatus, SlotLifecycle};
 use super::identity::{
     CanonicalModelRegistration, DcPoolCatalog, DcRelayIdentity, ModelTarget, WorkerRole,
 };
+use super::load::PoolLoadSnapshot;
 use super::pool_registry::PoolRegistry;
 use crate::frontend_load::{
     FRONTEND_LOAD_TOPIC, FRONTEND_LOAD_WINDOW_MS, FrontendLoadFrame, FrontendModelLoad,
@@ -306,7 +307,9 @@ async fn run_aggregate_publisher(
                     discovery_complete,
                 );
                 let catalog = pools.catalog();
-                let worker_pools = collect_worker_pools(&statuses, &catalog).await;
+                let load_snapshots = pools.load_snapshots();
+                let worker_pools =
+                    collect_worker_pools(&statuses, &catalog, &load_snapshots).await;
                 let now = Instant::now();
                 let usage = build_usage_snapshot(identity, &worker_pools);
                 let load = build_load_snapshot(
@@ -392,8 +395,13 @@ struct WorkerPool {
 async fn collect_worker_pools(
     statuses: &EndpointStatuses,
     catalog: &DcPoolCatalog,
+    load_snapshots: &[PoolLoadSnapshot],
 ) -> Vec<WorkerPool> {
     let status_map = statuses.read().await.clone();
+    let load_snapshots = load_snapshots
+        .iter()
+        .map(|snapshot| (snapshot.producer.pool_id(), *snapshot))
+        .collect::<HashMap<_, _>>();
     let mut result = Vec::with_capacity(catalog.pools().len());
     for descriptor in catalog.pools() {
         let Some(status) = status_map.get(descriptor.serving_endpoint()).cloned() else {
@@ -407,29 +415,20 @@ async fn collect_worker_pools(
             continue;
         };
         let role = endpoint_role(&membership.roles);
-        let monitor_snapshot = status.worker_monitor.as_ref().and_then(|monitor| {
-            monitor
-                .pool_snapshots(role)
-                .into_iter()
-                .find(|snapshot| snapshot.endpoint == membership.endpoint)
-        });
+        let load_snapshot = load_snapshots.get(&descriptor.pool_id()).copied();
         let lifecycle_active = status.lifecycle == SlotLifecycle::Active;
         drop(status);
 
-        let expected_ranks = monitor_snapshot
-            .as_ref()
-            .map_or(0, |snapshot| snapshot.expected_ranks);
-        let observed_ranks = monitor_snapshot
-            .as_ref()
-            .map_or(0, |snapshot| snapshot.observed_ranks);
-        let complete = lifecycle_active
-            && monitor_snapshot
-                .as_ref()
-                .is_some_and(|snapshot| snapshot.complete);
+        let expected_ranks = load_snapshot.map_or(0, |snapshot| {
+            u64::try_from(snapshot.kv_expected_ranks).unwrap_or(u64::MAX)
+        });
+        let observed_ranks = load_snapshot.map_or(0, |snapshot| {
+            u64::try_from(snapshot.kv_observed_ranks).unwrap_or(u64::MAX)
+        });
+        let complete = lifecycle_active && load_snapshot.is_some_and(PoolLoadSnapshot::is_complete);
         let (capacity_blocks, used_blocks) = if complete {
-            monitor_snapshot
-                .as_ref()
-                .map(|snapshot| (snapshot.capacity_blocks, snapshot.used_blocks))
+            load_snapshot
+                .map(|snapshot| (snapshot.total_kv_blocks, snapshot.kv_used_blocks))
                 .unwrap_or_default()
         } else {
             (None, None)
@@ -445,16 +444,15 @@ async fn collect_worker_pools(
             live_workers: complete.then_some(membership.runtime_configs.len() as u64),
             capacity_blocks,
             used_blocks,
-            active_decode_blocks: complete
-                .then(|| monitor_snapshot.as_ref()?.active_decode_blocks)
-                .flatten(),
-            active_prefill_tokens: complete
-                .then(|| monitor_snapshot.as_ref()?.active_prefill_tokens)
-                .flatten(),
+            active_decode_blocks: load_snapshot
+                .filter(|_| complete)
+                .and_then(|snapshot| snapshot.active_decode_blocks),
+            active_prefill_tokens: load_snapshot
+                .filter(|_| complete)
+                .and_then(|snapshot| snapshot.active_prefill_tokens),
             max_concurrency: complete.then_some(max_concurrency).flatten(),
             complete,
-            observed_at_unix_ms: monitor_snapshot
-                .as_ref()
+            observed_at_unix_ms: load_snapshot
                 .map_or(0, |snapshot| snapshot.source_observed_at_unix_ms),
         });
     }
@@ -541,24 +539,8 @@ fn build_load_snapshot(
         for model in &event.frame.models {
             registrations
                 .entry(model.model.clone())
-                .or_insert_with(|| ModelAggregate::from_frontend(model));
-        }
-    }
-
-    for aggregate in registrations.values_mut() {
-        for event in frontends.values() {
-            if !expected_publishers.contains(&event.publisher_id) {
-                continue;
-            }
-            let Some(model) = event
-                .frame
-                .models
-                .iter()
-                .find(|model| model.model == aggregate.registration.model)
-            else {
-                continue;
-            };
-            aggregate.observe(event, model, now);
+                .or_insert_with(|| ModelAggregate::from_frontend(model))
+                .observe(event, model, now);
         }
     }
 
@@ -636,9 +618,10 @@ impl ModelAggregate {
         self.ready_frontends = self
             .ready_frontends
             .saturating_add(u64::from(event.frame.serving_ready));
-        self.add(
+        add_counter(
+            &mut self.pending_first_output_requests,
             model.pending_first_output_requests,
-            Counter::PendingRequests,
+            &mut self.overflowed,
         );
         add_optional_counter(
             &mut self.pending_first_output_input_tokens,
@@ -650,13 +633,41 @@ impl ModelAggregate {
             model.live_input_tokens,
             &mut self.overflowed,
         );
-        self.add(model.input_processing_requests, Counter::InputRequests);
-        self.add(model.output_generation_requests, Counter::OutputRequests);
-        self.add(model.requests_started, Counter::Started);
-        self.add(model.requests_completed, Counter::Completed);
-        self.add(model.requests_failed, Counter::Failed);
-        self.add(model.requests_cancelled, Counter::Cancelled);
-        self.add(model.output_tokens, Counter::OutputTokens);
+        add_counter(
+            &mut self.input_processing_requests,
+            model.input_processing_requests,
+            &mut self.overflowed,
+        );
+        add_counter(
+            &mut self.output_generation_requests,
+            model.output_generation_requests,
+            &mut self.overflowed,
+        );
+        add_counter(
+            &mut self.requests_started,
+            model.requests_started,
+            &mut self.overflowed,
+        );
+        add_counter(
+            &mut self.requests_completed,
+            model.requests_completed,
+            &mut self.overflowed,
+        );
+        add_counter(
+            &mut self.requests_failed,
+            model.requests_failed,
+            &mut self.overflowed,
+        );
+        add_counter(
+            &mut self.requests_cancelled,
+            model.requests_cancelled,
+            &mut self.overflowed,
+        );
+        add_counter(
+            &mut self.output_tokens,
+            model.output_tokens,
+            &mut self.overflowed,
+        );
         self.input_tokens = match (self.input_tokens, model.input_tokens) {
             (Some(total), Some(value)) => total.checked_add(value),
             _ => None,
@@ -667,24 +678,6 @@ impl ModelAggregate {
                     current.min(event.published_at)
                 }),
         );
-    }
-
-    fn add(&mut self, value: u64, counter: Counter) {
-        let target = match counter {
-            Counter::PendingRequests => &mut self.pending_first_output_requests,
-            Counter::InputRequests => &mut self.input_processing_requests,
-            Counter::OutputRequests => &mut self.output_generation_requests,
-            Counter::Started => &mut self.requests_started,
-            Counter::Completed => &mut self.requests_completed,
-            Counter::Failed => &mut self.requests_failed,
-            Counter::Cancelled => &mut self.requests_cancelled,
-            Counter::OutputTokens => &mut self.output_tokens,
-        };
-        if let Some(total) = target.checked_add(value) {
-            *target = total;
-        } else {
-            self.overflowed = true;
-        }
     }
 
     fn finish(mut self, expected_frontends: u32, discovery_complete: bool) -> proto::ModelLoad {
@@ -722,17 +715,6 @@ impl ModelAggregate {
     }
 }
 
-enum Counter {
-    PendingRequests,
-    InputRequests,
-    OutputRequests,
-    Started,
-    Completed,
-    Failed,
-    Cancelled,
-    OutputTokens,
-}
-
 fn add_optional_counter(total: &mut Option<u64>, value: Option<u64>, overflowed: &mut bool) {
     *total = match (*total, value) {
         (Some(total), Some(value)) => match total.checked_add(value) {
@@ -744,6 +726,14 @@ fn add_optional_counter(total: &mut Option<u64>, value: Option<u64>, overflowed:
         },
         _ => None,
     };
+}
+
+fn add_counter(total: &mut u64, value: u64, overflowed: &mut bool) {
+    if let Some(value) = total.checked_add(value) {
+        *total = value;
+    } else {
+        *overflowed = true;
+    }
 }
 
 enum PoolEvent {
