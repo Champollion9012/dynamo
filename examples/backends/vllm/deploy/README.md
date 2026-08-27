@@ -56,7 +56,7 @@ Aggregated deployment that offloads KV cache to a per-node LMCache MP DaemonSet,
 
 **Architecture:**
 - `Frontend`: OpenAI-compatible API server
-- `VllmDecodeWorker`: Single worker, `hostIPC: true` + `runAsUser: 0` (required for cross-Pod CUDA IPC with the LMCache server)
+- `worker`: Single worker, `hostIPC: true` + `runAsUser: 0` (required for cross-Pod CUDA IPC with the LMCache server)
 - `LMCacheEngine` (separate CR): per-node DaemonSet that imports the worker's KV-cache IPC handles and serves cache hits over ZMQ
 
 ## CRD Structure
