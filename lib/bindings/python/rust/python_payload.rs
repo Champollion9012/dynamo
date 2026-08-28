@@ -212,11 +212,11 @@ pub(crate) fn encode_annotated_response<T: Serialize>(
     Ok((bytes, is_error))
 }
 
-/// [`encode_annotated_response`] into a buffer the caller owns, so the push
-/// path can reuse one allocation across a request's frames.
+/// Same as [`encode_annotated_response`], but writes into a buffer the caller
+/// owns so the push path can reuse one allocation across a request's frames.
 ///
-/// The wrapper shape lives here, and `encode_annotated_response` delegates to
-/// it, so the two cannot disagree about what a frame looks like.
+/// This is where the wrapper shape is defined; `encode_annotated_response` just
+/// calls it, so the two can never disagree about what a frame looks like.
 pub(crate) fn write_annotated_response<T: Serialize, W: std::io::Write>(
     codec: RequestPlanePayloadCodec,
     annotated: Annotated<T>,
@@ -231,36 +231,41 @@ pub(crate) fn write_annotated_response<T: Serialize, W: std::io::Write>(
     Ok(is_error)
 }
 
-// ── Steady-state token-frame fast path ───────────────────────────────────────
+// ── Token-frame fast path ────────────────────────────────────────────────────
 //
-// In streaming decode the overwhelming majority of frames are the two-key dict
-// the TRT-LLM handler builds per token (`token_ids` then `index`, see
-// `components/src/dynamo/trtllm/request_handlers/handler_base.py`); every other
-// field it can add is conditional. Encoding that dict generically costs a full
-// `Depythonizer` walk, and pythonize discovers each value's type by a ladder of
-// `is_none`/`is_instance_of`/`downcast` checks, then narrows every integer
-// through `extract::<u128>()` and a chain of `try_from`s
-// (`pythonize::de::deserialize_any`). Every token id pays that ladder, so write
-// these frames directly instead. `token_frame_matches_generic_encoding` pins
-// the bytes against the generic encoder.
+// While a model is streaming, nearly every response is the same two-key dict the
+// TRT-LLM handler builds per token — `{"token_ids": [...], "index": n}`, in that
+// order (see `components/src/dynamo/trtllm/request_handlers/handler_base.py`;
+// every other field it can add is conditional).
+//
+// Encoding that dict the generic way means walking it with pythonize, which has
+// to *discover* each value's type at runtime: a chain of `is_none` /
+// `is_instance_of` / `downcast` checks, then a narrowing cascade to size each
+// integer. Every single token id pays that cost.
+//
+// So we recognize this one shape and write its msgpack bytes by hand. Anything
+// else falls back to the generic path untouched. `token_frame_matches_generic_encoding`
+// pins our bytes against the generic encoder so the two can never diverge.
 
-/// `Annotated`'s and `NetworkStreamWrapper`'s payload key. Both envelopes carry
-/// only `data` here: their other fields are `Option` and skipped when `None`.
+/// The payload key used by both `Annotated` and `NetworkStreamWrapper`. Their
+/// other fields are `Option` and are skipped when `None`, so for this frame
+/// `data` is the only key either envelope carries.
 const KEY_DATA: &str = "data";
 const KEY_COMPLETE_FINAL: &str = "complete_final";
 const KEY_TOKEN_IDS: &str = "token_ids";
 const KEY_INDEX: &str = "index";
 
-/// Encode a steady-state token frame straight to msgpack, bypassing serde.
+/// Try to encode a token frame straight to msgpack, skipping serde entirely.
 ///
-/// Returns `false`, having written nothing, if `dict` is not exactly a
-/// `token_ids`-then-`index` frame of non-negative `int`s — the caller must then
-/// fall back to the generic path. Msgpack only; the JSON codec keeps the
-/// generic path.
+/// Returns `true` if `dict` matched and the frame was written. Returns `false`,
+/// having written nothing, if it did not — the caller must then use the generic
+/// path. To match, `dict` must be exactly `token_ids` then `index`, holding a
+/// list of non-negative ints and a non-negative int. Msgpack only; JSON always
+/// takes the generic path.
 pub(crate) fn try_write_token_frame(dict: &Bound<'_, PyDict>, out: &mut BytesMut) -> bool {
-    // A bail can happen after some bytes are written (a token id partway
-    // through the list can be the first thing to disqualify the frame), so rewind
-    // to wherever the caller left off. Half a frame followed by a whole one is
+    // We can only tell a frame is ineligible partway through writing it — a bad
+    // token id in the middle of the list, say — so remember where the caller
+    // left off and rewind on failure. Half a frame followed by a whole one is
     // undecodable garbage on the wire.
     let rewind = out.len();
     if parse_and_write_token_frame(dict, out).is_none() {
@@ -271,14 +276,16 @@ pub(crate) fn try_write_token_frame(dict: &Bound<'_, PyDict>, out: &mut BytesMut
 }
 
 fn parse_and_write_token_frame(dict: &Bound<'_, PyDict>, out: &mut BytesMut) -> Option<()> {
-    // Match on iteration ORDER, not by key lookup. A msgpack map records its
-    // entries in the order the serializer visits them, which on the generic
-    // path is the Python dict's insertion order — so a dict carrying these two
-    // keys the other way round must not be encoded as if it were in this
-    // order, or the fast and generic paths would produce different bytes for
-    // the same object. Checking order is also what makes this a complete test
-    // of the shape: a third key fails the `next()` check, and an `_dynamo_annotated`
-    // envelope cannot match at all, so skipping `parse_python_response` is safe.
+    // Match on iteration ORDER, not by key lookup.
+    //
+    // A msgpack map stores its entries in the order the serializer visits them,
+    // which for a Python dict is insertion order. So a dict holding these same
+    // two keys the other way round has to encode the other way round too — if
+    // we matched it here, the fast and generic paths would disagree on bytes.
+    //
+    // Matching on order also makes this a *complete* check of the shape: a third
+    // key fails the `next()` below, and a `_dynamo_annotated` envelope can never
+    // match. That is what makes it safe to skip `parse_python_response`.
     let mut entries = dict.iter();
     let (token_ids_key, token_ids) = entries.next()?;
     let (index_key, index) = entries.next()?;
@@ -300,16 +307,17 @@ fn parse_and_write_token_frame(dict: &Bound<'_, PyDict>, out: &mut BytesMut) -> 
     )
 }
 
-/// Emit the msgpack for one token frame.
+/// Write the msgpack bytes for one token frame.
 ///
-/// Split from the Python side of the fast path so the wire layout — the part
-/// that has to agree with the generic encoder exactly — is testable without
-/// libpython, which this crate's unit tests cannot link. See the module tests.
+/// Kept separate from the Python-facing code above so the wire layout — the part
+/// that must match the generic encoder exactly — can be unit-tested. This crate
+/// builds as a PyO3 extension module and so does not link libpython, meaning
+/// `cargo test` cannot touch Python objects. See the module tests below.
 ///
-/// `token_count` must be the number of items `token_ids` yields: msgpack writes
-/// an array's length ahead of its elements, so a disagreement produces a frame
-/// that cannot be decoded. A `None` item aborts the frame, which is why the
-/// caller must be prepared to rewind.
+/// `token_count` must equal the number of items `token_ids` yields. msgpack
+/// writes an array's length *before* its elements, so a mismatch produces a
+/// frame that cannot be decoded. A `None` item aborts the frame mid-write, which
+/// is why the caller has to be able to rewind.
 fn write_token_frame_bytes<W, I>(
     token_ids: I,
     token_count: u32,
@@ -320,10 +328,12 @@ where
     W: std::io::Write,
     I: Iterator<Item = Option<u64>>,
 {
-    // NetworkStreamWrapper { data, complete_final }
+    // Three nested maps, matching what serde would emit:
+    //   NetworkStreamWrapper { data, complete_final }
+    //     -> Annotated { data }   (id/event/comment/error are None, so skipped)
+    //          -> { token_ids, index }
     rmp::encode::write_map_len(writer, 2).ok()?;
     rmp::encode::write_str(writer, KEY_DATA).ok()?;
-    // Annotated { data } — id/event/comment/error are None, so serde skips them.
     rmp::encode::write_map_len(writer, 1).ok()?;
     rmp::encode::write_str(writer, KEY_DATA).ok()?;
     rmp::encode::write_map_len(writer, 2).ok()?;
@@ -352,14 +362,18 @@ fn key_is(key: &Bound<'_, PyAny>, name: &str) -> bool {
         .is_some_and(|key| key == name)
 }
 
-/// `value` as a `u64`, if it is one on the generic path too.
+/// `value` as a `u64` — but only if the generic path would also encode it as a
+/// plain unsigned integer.
 ///
-/// `downcast_exact` is load-bearing: `bool` is an `int` subclass, and pythonize
-/// tests `PyBool` *before* `PyInt`, so a `True` in a token list encodes as a
-/// msgpack bool generically and must not become the integer 1 here. `extract`
-/// then rejects negatives and anything past `u64`, both of which the generic
-/// path encodes differently (`write_sint`, and `serialize_u128` which emits
-/// *bytes*).
+/// `downcast_exact` is load-bearing. In Python `bool` is a subclass of `int`,
+/// and pythonize checks `PyBool` *before* `PyInt`, so generically a `True` in a
+/// token list becomes a msgpack bool. It must not silently become the integer 1
+/// here. Requiring the exact type keeps bools (and any other `int` subclass) on
+/// the generic path.
+///
+/// `extract` then rejects negatives and anything larger than `u64`, which the
+/// generic path also encodes differently — as a signed int, and as msgpack
+/// *bytes* respectively.
 fn exact_uint(value: &Bound<'_, PyAny>) -> Option<u64> {
     value.downcast_exact::<PyInt>().ok()?.extract().ok()
 }
@@ -496,21 +510,22 @@ mod tests {
 
     // ── token-frame fast path: wire equivalence ──────────────────────────────
     //
-    // `try_write_token_frame` bypasses serde for the steady-state TRT-LLM decode
-    // frame. That is only sound if it produces the SAME bytes as the generic
-    // path, so these tests encode the identical logical response both ways and
-    // compare. Byte equality, not just "both decode": the two paths are chosen
-    // per frame within a single stream, so any divergence in map ordering or
-    // integer width would be a wire difference between consecutive frames of
-    // the same response.
+    // The fast path skips serde. That is only safe if it produces the SAME bytes
+    // the generic path would, so these tests encode one logical response both
+    // ways and compare.
     //
-    // The Python half (`parse_and_write_token_frame`'s shape and type checks) cannot
-    // be covered here -- it needs libpython, which this crate's tests do not
-    // link -- so it is covered by pytest against the built extension.
+    // Byte equality, not just "both decode": the two paths are picked per frame
+    // *within a single response stream*, so any difference in map ordering or
+    // integer width would be a wire mismatch between consecutive frames of one
+    // response.
+    //
+    // The Python half — the shape and type checks in `parse_and_write_token_frame`
+    // — cannot be tested here, since these tests do not link libpython. It is
+    // covered by pytest against the built extension instead.
 
-    /// The dict `handler_base.py` builds per token, with its fields in the same
-    /// order Python inserts them. `to_vec_named` writes a struct as a map, so
-    /// this serializes exactly as the Python dict does.
+    /// Stands in for the dict `handler_base.py` builds per token, with the fields
+    /// in the same order Python inserts them. msgpack writes a Rust struct as a
+    /// map, so this serializes exactly as that Python dict does.
     #[derive(Serialize)]
     struct TokenFramePayload {
         token_ids: Vec<u32>,
@@ -544,8 +559,9 @@ mod tests {
         bytes
     }
 
-    /// Magnitudes that straddle every msgpack uint marker boundary. These are
-    /// where a hand-written encoder diverges from `write_uint`.
+    /// Values on both sides of every msgpack uint marker boundary. msgpack picks
+    /// a different marker byte per magnitude, so these are where a hand-written
+    /// encoder would drift from `write_uint`.
     const MAGNITUDES: [u32; 9] = [0, 1, 127, 128, 255, 256, 65_535, 65_536, u32::MAX];
 
     fn assert_encodings_agree(token_ids: &[u32], index: u32) {
@@ -556,8 +572,8 @@ mod tests {
         );
     }
 
-    /// Token id widths, and list lengths straddling the fixarray boundary where
-    /// `write_array_len` changes marker.
+    /// Covers token id widths, plus list lengths on both sides of the fixarray
+    /// boundary where `write_array_len` switches marker.
     #[test]
     fn token_frame_matches_generic_encoding() {
         let mut cases: Vec<Vec<u32>> = vec![
@@ -575,8 +591,8 @@ mod tests {
         }
     }
 
-    /// `index` is encoded independently of the token list, so it only needs the
-    /// uint boundaries rather than a cross product with the cases above.
+    /// `index` is encoded independently of the token list, so it only needs its
+    /// own uint boundaries — no cross product with the cases above.
     #[test]
     fn token_frame_index_matches_generic_encoding() {
         for index in MAGNITUDES {
@@ -584,9 +600,12 @@ mod tests {
         }
     }
 
-    /// The frame the fast path writes must decode to the same envelope the rest
-    /// of the request plane expects — `data` present, no error, not terminal.
-    /// Byte equality above would not catch both paths being wrong together.
+    /// The frame must decode to the envelope the rest of the request plane
+    /// expects: `data` present, no error, not the end-of-stream marker.
+    ///
+    /// The byte-equality tests above compare the two paths to each other, so they
+    /// would pass if both were wrong in the same way. This one checks the result
+    /// independently.
     #[test]
     fn token_frame_decodes_as_a_non_terminal_data_frame() {
         let bytes = fast_encoding(&[7, 8], 3);
@@ -621,8 +640,8 @@ mod tests {
         assert_eq!(field("index").as_u64(), Some(3));
     }
 
-    /// A token the Python side could not convert aborts the frame. The caller
-    /// rewinds on `None`, so a partial frame must never be reported as written.
+    /// A token the Python side could not convert must abort the whole frame,
+    /// never report a partial one as written. The caller rewinds on `None`.
     #[test]
     fn token_frame_aborts_on_an_unconvertible_token() {
         let mut bytes = Vec::new();
@@ -633,8 +652,8 @@ mod tests {
         );
     }
 
-    /// A token count disagreeing with the number of tokens yielded would write
-    /// an array header that lies about its length — undecodable on the wire.
+    /// If the declared count and the tokens actually yielded disagree, the array
+    /// header would lie about its length and the frame would not decode.
     #[test]
     fn token_frame_rejects_a_token_count_mismatch() {
         let mut bytes = Vec::new();

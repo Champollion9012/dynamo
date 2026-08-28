@@ -80,27 +80,27 @@ pub fn add_to_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 /// One request's reusable frame-encoding buffer.
 ///
-/// Frames are written into a chunk that outlives them and cut out with `split`,
-/// so the allocator is hit about once per chunk's worth of frames rather than
-/// once per frame.
+/// Instead of allocating per frame, frames are written into a larger chunk and
+/// cut out of it with `split`. That means one allocation per chunk's worth of
+/// frames rather than one per frame.
 ///
-/// `split` leaves the frames sharing the chunk they came from, so a chunk is
-/// freed only once every frame cut from it has been consumed. That is bounded
-/// by the channel depth and a chunk is small, so the retention is not worth
-/// avoiding.
+/// `split` does not copy: each frame keeps a reference to the chunk it came
+/// from, so a chunk is freed only once every frame cut from it has been sent.
+/// The response channel bounds how many can be outstanding, and a chunk is
+/// small, so that retention is not worth designing around.
 struct EncodeBuffer {
     buf: BytesMut,
-    /// Frames in one stream are near-identical in size, so the last one is used
-    /// to predict the room the next one needs.
+    /// Frames within one stream are all about the same size, so the last one is
+    /// a good predictor of how much room the next one needs.
     last_frame_len: usize,
 }
 
 impl EncodeBuffer {
-    /// Allocation granularity. Steady-state token frames are tens of bytes, so
-    /// one chunk covers many of them.
+    /// How much is allocated at a time. Token frames are tens of bytes, so one
+    /// chunk covers many of them.
     const CHUNK: usize = 8 * 1024;
-    /// Floor for the room to demand, so the first frame of a request is chunked
-    /// like the rest instead of growing from nothing.
+    /// Minimum room to ask for, so a request's first frame — which has no
+    /// previous frame to predict from — is chunked like all the rest.
     const MIN_RESERVE: usize = 64;
 
     fn new() -> Self {
@@ -110,9 +110,9 @@ impl EncodeBuffer {
         }
     }
 
-    /// Ensure there is room for another frame. A no-op while the current chunk
-    /// has space; a frame larger than the prediction still succeeds, because
-    /// `BytesMut` grows on write.
+    /// Make room for another frame. Does nothing while the current chunk still
+    /// has space. A frame bigger than predicted is fine either way — `BytesMut`
+    /// grows on write.
     fn reserve(&mut self) {
         let needed = self.last_frame_len.max(Self::MIN_RESERVE);
         if self.buf.capacity() < needed {
@@ -120,7 +120,8 @@ impl EncodeBuffer {
         }
     }
 
-    /// Cut the frame just written out of the chunk.
+    /// Cut the frame just written out of the chunk, and remember its size for
+    /// the next `reserve`.
     fn take(&mut self) -> Bytes {
         self.last_frame_len = self.buf.len();
         self.buf.split().freeze()
@@ -142,14 +143,14 @@ impl EncodeBuffer {
 /// straight into the codec in one pass, exactly as on the pull path, and
 /// nothing the codec can represent is narrowed on the way.
 ///
-/// `codec` records which codec produced `bytes`. `send` has no request in hand,
-/// so the sink captures the process-global
-/// [`RequestPlanePayloadCodec::configured`] once per request — the value this
-/// worker advertises in its instance record, which is where callers read the
-/// codec they address it with. The two agree except against a caller
-/// old enough to predict neither, which falls back to JSON;
-/// [`PushFrame::into_encoded`] re-encodes for that case rather than putting the
-/// wrong bytes on the wire.
+/// `codec` records which codec produced `bytes`. `send` has no request in hand
+/// to read the codec from, so the sink captures the process-global
+/// [`RequestPlanePayloadCodec::configured`] once per request. That is the value
+/// this worker advertises in its instance record, which is also where callers
+/// look up the codec to address it with — so the two normally agree. The one
+/// exception is a caller old enough to predict neither, which falls back to
+/// JSON. [`PushFrame::into_encoded`] re-encodes for that case rather than
+/// putting the wrong bytes on the wire.
 pub(crate) struct PushFrame {
     bytes: Bytes,
     is_error: bool,
@@ -169,25 +170,27 @@ impl std::fmt::Debug for PushFrame {
 impl PushFrame {
     /// Encode one Python response object, with the GIL held by the caller.
     ///
-    /// Two paths produce identical bytes.
-    /// `python_payload::try_write_token_frame` takes the steady-state TRT-LLM
-    /// token frame — the great majority of responses in a streaming decode — and
-    /// writes it without serde or pythonize. Everything else goes through the
-    /// same two functions the pull path uses, `parse_python_response` to
-    /// interpret the object and `write_annotated_response` to produce the bytes,
-    /// so those cannot drift.
+    /// Two paths, producing identical bytes. `try_write_token_frame` handles the
+    /// per-token frame — the great majority of responses while streaming — with
+    /// no serde and no pythonize. Everything else uses the same two functions the
+    /// pull path uses (`parse_python_response` to interpret the object,
+    /// `write_annotated_response` to produce the bytes), so the two paths cannot
+    /// drift apart.
     ///
-    /// The shared buffer is taken only if it is free. [`Self::write`] walks
-    /// `obj`, which can run arbitrary Python — `__bool__` on an envelope's
-    /// truthiness test, `__iter__` or `__len__` inside the pythonize walk — and
-    /// that Python could call `send` again on this same sender. The mutex is not
-    /// reentrant, and blocking here would freeze the event-loop thread with the
-    /// GIL held, stalling every other request in the interpreter. So a
-    /// re-entrant call falls back to a private buffer: slower for that frame,
-    /// which is the right trade against a hang.
+    /// ## Why `try_lock` rather than `lock`
     ///
-    /// The lock is released before returning either way, and so before the
-    /// caller's possibly-blocking enqueue.
+    /// [`Self::write`] walks `obj`, and walking a Python object can run arbitrary
+    /// Python: `__bool__` when an envelope is tested for truthiness, `__iter__` or
+    /// `__len__` during the pythonize walk. That Python is free to call `send`
+    /// again on this same sender.
+    ///
+    /// The mutex is not reentrant, so blocking here would deadlock the event-loop
+    /// thread *while it holds the GIL*, stalling every request in the interpreter.
+    /// Instead a re-entrant call falls back to its own private buffer — slower for
+    /// that one frame, which is a good trade against a hang.
+    ///
+    /// Either way the lock is released before returning, and so before the
+    /// caller's enqueue, which can block.
     fn encode(
         py: Python<'_>,
         obj: &Bound<'_, PyAny>,
@@ -212,16 +215,17 @@ impl PushFrame {
                 codec,
             }),
             Err(error) => {
-                // The frame may be half-written; the next one must not inherit
-                // its bytes.
+                // The frame may be half-written. Drop those bytes so the next
+                // frame does not inherit them.
                 pooled.discard();
                 Err(error)
             }
         }
     }
 
-    /// Write one response's frame into `out` and report whether it is an error
-    /// frame. `out` may hold a partial frame if this fails.
+    /// Write one response's frame into `out`, returning whether it is an error
+    /// frame. On failure `out` may be left holding a partial frame, so the
+    /// caller must discard or rewind it.
     fn write(
         py: Python<'_>,
         obj: &Bound<'_, PyAny>,
@@ -232,9 +236,9 @@ impl PushFrame {
             && let Ok(dict) = obj.downcast::<PyDict>()
             && python_payload::try_write_token_frame(dict, out)
         {
-            // A token frame carries no error field, so it is never an error
-            // frame; `try_write_token_frame` only accepts dicts that cannot be
-            // an `_dynamo_annotated` envelope.
+            // Never an error frame: a token frame has no error field, and
+            // `try_write_token_frame` only accepts dicts whose exact key set
+            // rules out an `_dynamo_annotated` envelope.
             return Ok(false);
         }
 
@@ -332,13 +336,13 @@ struct ResponseSink {
     /// response stream would leave the handler generating into nothing until it
     /// noticed the send error on its own.
     ctx: Arc<dyn AsyncEngineContext>,
-    /// Read once per request rather than once per frame. It is a `OnceLock`
-    /// behind [`RequestPlanePayloadCodec::configured`], so a later read could
-    /// only return this same value.
+    /// Read once per request instead of once per frame. It is backed by a
+    /// `OnceLock` (see [`RequestPlanePayloadCodec::configured`]), so reading it
+    /// again later could only ever return this same value.
     codec: RequestPlanePayloadCodec,
     /// Reused across this request's frames. Behind a mutex because `send` takes
-    /// `&self`; uncontended in practice, since one request's handler pushes
-    /// from one event-loop thread.
+    /// `&self`. Uncontended in practice: one request's handler pushes from a
+    /// single event-loop thread.
     encode_buffer: parking_lot::Mutex<EncodeBuffer>,
 }
 
