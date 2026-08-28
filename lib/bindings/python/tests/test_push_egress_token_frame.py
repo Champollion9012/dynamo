@@ -61,7 +61,8 @@ _ELIGIBLE = [
 ]
 
 # Ineligible: each trips a different clause of the gate and must fall back to
-# the generic encoder with its value intact.
+# the generic encoder, which preserves the value wherever msgpack can represent
+# it at all.
 _INELIGIBLE = [
     # In Python bool is a subclass of int, and pythonize checks PyBool before
     # PyInt, so the generic path encodes these as msgpack bools. The fast path
@@ -72,7 +73,14 @@ _INELIGIBLE = [
     # so neither may take the fast path.
     ({"token_ids": [-1], "index": 0}, None),
     ({"token_ids": [1], "index": -1}, None),
-    ({"token_ids": [2**64], "index": 0}, None),
+    # msgpack has no uint128, so rmp-serde writes a past-u64 int as a 16-byte
+    # big-endian `bin`. That is pre-existing generic-path behaviour and is why
+    # this frame does not come back as an int on *either* path -- what matters
+    # here is only that the fast path declined it, which the bytes prove.
+    (
+        {"token_ids": [2**64], "index": 0},
+        {"token_ids": [(2**64).to_bytes(16, "big")], "index": 0},
+    ),
     # Not a list.
     ({"token_ids": (1, 2), "index": 0}, {"token_ids": [1, 2], "index": 0}),
     ({"token_ids": 5, "index": 0}, None),
