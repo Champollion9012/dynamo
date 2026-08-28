@@ -106,6 +106,25 @@ impl RequestPlanePayloadCodec {
         }
     }
 
+    /// Encode into a writer the caller owns, so a hot path can reuse one buffer
+    /// across frames instead of allocating a `Vec` per frame.
+    ///
+    /// Byte-identical to [`Self::encode`] — `to_vec_named` and `to_vec` are
+    /// themselves these same two calls against a `Vec`. Pinned by
+    /// `encode_into_matches_encode_byte_for_byte`, because a hot path that
+    /// silently produced different bytes than the rest of the request plane
+    /// would only surface as a decode failure at the caller.
+    pub fn encode_into<T, W>(&self, value: &T, writer: &mut W) -> Result<()>
+    where
+        T: Serialize + ?Sized,
+        W: std::io::Write,
+    {
+        match self {
+            Self::Json => Ok(serde_json::to_writer(writer, value)?),
+            Self::Msgpack => Ok(rmp_serde::encode::write_named(writer, value)?),
+        }
+    }
+
     pub fn decode<T: DeserializeOwned>(&self, bytes: &[u8]) -> Result<T> {
         match self {
             Self::Json => Ok(serde_json::from_slice(bytes)?),
@@ -482,6 +501,33 @@ mod tests {
         id: u64,
         text: String,
         tokens: Vec<u32>,
+    }
+
+    /// `encode_into` exists so hot paths can reuse a buffer; it is only safe to
+    /// use in place of `encode` if it produces the same bytes. Both codecs are
+    /// checked, and the payload covers a nested map, a sequence, and a string.
+    #[test]
+    fn encode_into_matches_encode_byte_for_byte() {
+        let payload = NetworkStreamWrapper {
+            data: Some(TestPayload {
+                id: 7,
+                text: "hello".to_string(),
+                tokens: vec![1, 200, 70_000],
+            }),
+            complete_final: false,
+        };
+
+        for codec in [
+            RequestPlanePayloadCodec::Json,
+            RequestPlanePayloadCodec::Msgpack,
+        ] {
+            let expected = codec.encode(&payload).expect("encode");
+            let mut actual = Vec::new();
+            codec
+                .encode_into(&payload, &mut actual)
+                .expect("encode_into");
+            assert_eq!(expected, actual, "codec={}", codec.name());
+        }
     }
 
     #[test]
