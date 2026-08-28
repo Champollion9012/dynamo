@@ -243,9 +243,15 @@ pub(crate) fn write_annotated_response<T: Serialize, W: std::io::Write>(
 // This fast path skips that ladder. Byte-equivalence with the generic encoder is
 // verified by the `token_frame_matches_generic_encoding` test.
 
-/// The `data` payload key. This path writes only `data` for both `Annotated` and
-/// `NetworkStreamWrapper`; every other field on them is an `Option`, `None` here,
-/// and so skipped by serde.
+/// The `data` key, which both envelopes use: `NetworkStreamWrapper.data` holds
+/// the `Annotated`, and `Annotated.data` holds the token payload.
+///
+/// `Annotated` reduces to this one key. Its `id`, `event`, `comment` and `error`
+/// fields are all `Option`s holding `None` on a token frame, and serde's
+/// `skip_serializing_if` drops a `None` field outright — no key is written and it
+/// is not counted in the map length. `NetworkStreamWrapper` keeps two keys,
+/// because `complete_final` is a plain `bool` and is always written. That is
+/// where the hardcoded map lengths below come from.
 const KEY_DATA: &str = "data";
 const KEY_COMPLETE_FINAL: &str = "complete_final";
 const KEY_TOKEN_IDS: &str = "token_ids";
