@@ -38,7 +38,10 @@ use crate::{
         preprocessor::{BootstrapInfo, PrefillResult, TraceLink},
         timing::{RequestPhase, RequestTracker},
     },
-    session_affinity::{AffinityCoordinator, AffinityTarget, SessionAffinityMode},
+    session_affinity::{
+        ADVISORY_DECODE_TARGET_CONTEXT_KEY, AffinityCoordinator, AffinityTarget,
+        SessionAffinityMode,
+    },
 };
 
 mod activation;
@@ -284,7 +287,7 @@ where
         next: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>>,
     ) -> Result<ManyOut<Annotated<LLMEngineOutput>>> {
         // Extract request data while preserving context
-        let (mut req, context) = request.into_parts();
+        let (mut req, mut context) = request.into_parts();
         let request_id = context.id().to_string();
         let metadata = context.metadata().clone();
         let policy_class = context.metadata().get("policy-class").cloned();
@@ -345,6 +348,9 @@ where
                     routing.decode_worker_id = Some(decision.worker.worker_id);
                     routing.dp_rank = Some(decision.worker.dp_rank);
 
+                    if decision.advisory {
+                        context.insert(ADVISORY_DECODE_TARGET_CONTEXT_KEY, ());
+                    }
                     req.annotations
                         .push(BYPASS_REMOTE_PREFILL_ANNOTATION.to_string());
 

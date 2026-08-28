@@ -26,6 +26,7 @@ pub(super) struct ConditionalDisaggDecodeDecision {
     pub worker: WorkerWithDpRank,
     pub overlap_tokens: usize,
     pub net_new_tokens: usize,
+    pub advisory: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -152,6 +153,7 @@ where
                 return Ok(None);
             }
         };
+        let advisory = request_pinned_worker.is_none();
         let (pinned_worker, affinity_target) = match request_pinned_worker {
             Some(worker) => (Some(worker), None),
             None if self.session_affinity_mode == SessionAffinityMode::Soft => (
@@ -301,6 +303,7 @@ where
                 worker,
                 overlap_tokens,
                 net_new_tokens,
+                advisory,
             }));
         }
 
