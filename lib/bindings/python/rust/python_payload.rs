@@ -231,25 +231,21 @@ pub(crate) fn write_annotated_response<T: Serialize, W: std::io::Write>(
     Ok(is_error)
 }
 
-// ── Token-frame fast path ────────────────────────────────────────────────────
+// ── Steady-state token-frame fast path ───────────────────────────────────────
 //
-// While a model is streaming, nearly every response is the same two-key dict the
-// TRT-LLM handler builds per token — `{"token_ids": [...], "index": n}`, in that
-// order (see `components/src/dynamo/trtllm/request_handlers/handler_base.py`;
-// every other field it can add is conditional).
+// Writes standard TRT-LLM token frames directly to bypass costly generic
+// serialization.
 //
-// Encoding that dict the generic way means walking it with pythonize, which has
-// to *discover* each value's type at runtime: a chain of `is_none` /
-// `is_instance_of` / `downcast` checks, then a narrowing cascade to size each
-// integer. Every single token id pays that cost.
+// Streaming decode predominantly produces a two-key dict (`token_ids`, `index`).
+// Using the generic `pythonize` encoder creates massive overhead due to
+// sequential type-checking and integer downcasting for every single token ID.
 //
-// So we recognize this one shape and write its msgpack bytes by hand. Anything
-// else falls back to the generic path untouched. `token_frame_matches_generic_encoding`
-// pins our bytes against the generic encoder so the two can never diverge.
+// This fast path skips that ladder. Byte-equivalence with the generic encoder is
+// verified by the `token_frame_matches_generic_encoding` test.
 
-/// The payload key used by both `Annotated` and `NetworkStreamWrapper`. Their
-/// other fields are `Option` and are skipped when `None`, so for this frame
-/// `data` is the only key either envelope carries.
+/// The `data` payload key. This path writes only `data` for both `Annotated` and
+/// `NetworkStreamWrapper`; every other field on them is an `Option`, `None` here,
+/// and so skipped by serde.
 const KEY_DATA: &str = "data";
 const KEY_COMPLETE_FINAL: &str = "complete_final";
 const KEY_TOKEN_IDS: &str = "token_ids";
