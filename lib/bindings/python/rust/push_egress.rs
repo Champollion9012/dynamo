@@ -80,14 +80,18 @@ pub fn add_to_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 /// One request's reusable frame-encoding buffer.
 ///
-/// Instead of allocating per frame, frames are written into a larger chunk and
-/// cut out of it with `split`. That means one allocation per chunk's worth of
-/// frames rather than one per frame.
+/// Rather than allocating a buffer per frame, every frame is written into one
+/// large `BytesMut` chunk and then handed out using [`BytesMut::split`] — the
+/// `bytes` crate method that returns the bytes written so far as a separate
+/// handle and leaves `buf` empty but still holding the rest of the chunk's
+/// capacity. The allocator is therefore touched about once per chunk instead of
+/// once per frame.
 ///
-/// `split` does not copy: each frame keeps a reference to the chunk it came
-/// from, so a chunk is freed only once every frame cut from it has been sent.
-/// The response channel bounds how many can be outstanding, and a chunk is
-/// small, so that retention is not worth designing around.
+/// `split` is `O(1)` and copies nothing: both handles point into the same
+/// allocation and share a reference count. A chunk is only freed once every
+/// frame taken from it has been sent and dropped. The response channel bounds
+/// how many can be in flight at a time and a chunk is small, so that retention
+/// is not worth designing around.
 struct EncodeBuffer {
     buf: BytesMut,
     /// Frames within one stream are all about the same size, so the last one is
@@ -110,9 +114,9 @@ impl EncodeBuffer {
         }
     }
 
-    /// Make room for another frame. Does nothing while the current chunk still
-    /// has space. A frame bigger than predicted is fine either way — `BytesMut`
-    /// grows on write.
+    /// Make room for another frame, allocating a fresh chunk only once the
+    /// leftover capacity in the current one runs short. A frame bigger than
+    /// predicted is fine either way — `BytesMut` grows on write.
     fn reserve(&mut self) {
         let needed = self.last_frame_len.max(Self::MIN_RESERVE);
         if self.buf.capacity() < needed {
@@ -120,8 +124,10 @@ impl EncodeBuffer {
         }
     }
 
-    /// Cut the frame just written out of the chunk, and remember its size for
-    /// the next `reserve`.
+    /// Hand out the frame just written as its own `Bytes`, and remember its
+    /// length so the next [`Self::reserve`] knows what to expect. `buf` is left
+    /// empty, with whatever is left of the chunk still available to the frame
+    /// after this one.
     fn take(&mut self) -> Bytes {
         self.last_frame_len = self.buf.len();
         self.buf.split().freeze()
