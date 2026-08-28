@@ -170,27 +170,14 @@ impl std::fmt::Debug for PushFrame {
 impl PushFrame {
     /// Encode one Python response object, with the GIL held by the caller.
     ///
-    /// Two paths, producing identical bytes. `try_write_token_frame` handles the
-    /// per-token frame — the great majority of responses while streaming — with
-    /// no serde and no pythonize. Everything else uses the same two functions the
-    /// pull path uses (`parse_python_response` to interpret the object,
-    /// `write_annotated_response` to produce the bytes), so the two paths cannot
-    /// drift apart.
+    /// Writes byte-identical responses via two paths: a fast path
+    /// (`try_write_token_frame`) for standard TRT-LLM tokens bypassing `serde`,
+    /// and a fallback path shared with the pull path to prevent drift.
     ///
-    /// ## Why `try_lock` rather than `lock`
-    ///
-    /// [`Self::write`] walks `obj`, and walking a Python object can run arbitrary
-    /// Python: `__bool__` when an envelope is tested for truthiness, `__iter__` or
-    /// `__len__` during the pythonize walk. That Python is free to call `send`
-    /// again on this same sender.
-    ///
-    /// The mutex is not reentrant, so blocking here would deadlock the event-loop
-    /// thread *while it holds the GIL*, stalling every request in the interpreter.
-    /// Instead a re-entrant call falls back to its own private buffer — slower for
-    /// that one frame, which is a good trade against a hang.
-    ///
-    /// Either way the lock is released before returning, and so before the
-    /// caller's enqueue, which can block.
+    /// Serialization uses a non-blocking shared buffer. To prevent GIL deadlocks
+    /// if arbitrary Python code triggers a re-entrant `send` call, it safely
+    /// falls back to a slower private buffer. The lock is always released
+    /// before returning to the caller.
     fn encode(
         py: Python<'_>,
         obj: &Bound<'_, PyAny>,
