@@ -526,14 +526,18 @@ mod tests {
     /// Stands in for the dict `handler_base.py` builds per token, with the fields
     /// in the same order Python inserts them. msgpack writes a Rust struct as a
     /// map, so this serializes exactly as that Python dict does.
+    ///
+    /// `u64`, not `u32`, to match what the fast path actually accepts: `exact_uint`
+    /// takes any value up to `u64::MAX`, so the comparison has to reach that far
+    /// too or the widest markers would go unchecked.
     #[derive(Serialize)]
     struct TokenFramePayload {
-        token_ids: Vec<u32>,
-        index: u32,
+        token_ids: Vec<u64>,
+        index: u64,
     }
 
     /// What the generic path puts on the wire for this frame.
-    fn generic_encoding(token_ids: &[u32], index: u32) -> Vec<u8> {
+    fn generic_encoding(token_ids: &[u64], index: u64) -> Vec<u8> {
         let (bytes, is_error) = encode_annotated_response(
             RequestPlanePayloadCodec::Msgpack,
             Annotated::from_data(TokenFramePayload {
@@ -547,12 +551,12 @@ mod tests {
     }
 
     /// What the fast path puts on the wire for this frame.
-    fn fast_encoding(token_ids: &[u32], index: u32) -> Vec<u8> {
+    fn fast_encoding(token_ids: &[u64], index: u64) -> Vec<u8> {
         let mut bytes = Vec::new();
         write_token_frame_bytes(
-            token_ids.iter().map(|id| Some(u64::from(*id))),
+            token_ids.iter().copied().map(Some),
             u32::try_from(token_ids.len()).expect("length fits u32"),
-            u64::from(index),
+            index,
             &mut bytes,
         )
         .expect("fast encode must succeed");
@@ -561,10 +565,24 @@ mod tests {
 
     /// Values on both sides of every msgpack uint marker boundary. msgpack picks
     /// a different marker byte per magnitude, so these are where a hand-written
-    /// encoder would drift from `write_uint`.
-    const MAGNITUDES: [u32; 9] = [0, 1, 127, 128, 255, 256, 65_535, 65_536, u32::MAX];
+    /// encoder would drift from `write_uint`. Runs to `u64::MAX` because that is
+    /// the largest value the fast path will accept.
+    const MAGNITUDES: [u64; 12] = [
+        0,
+        1,
+        127,           // largest positive fixint
+        128,           // first needing uint8
+        255,           // largest uint8
+        256,           // first needing uint16
+        65_535,        // largest uint16
+        65_536,        // first needing uint32
+        4_294_967_295, // largest uint32
+        4_294_967_296, // first needing uint64
+        u64::MAX - 1,
+        u64::MAX,
+    ];
 
-    fn assert_encodings_agree(token_ids: &[u32], index: u32) {
+    fn assert_encodings_agree(token_ids: &[u64], index: u64) {
         assert_eq!(
             fast_encoding(token_ids, index),
             generic_encoding(token_ids, index),
@@ -576,7 +594,7 @@ mod tests {
     /// boundary where `write_array_len` switches marker.
     #[test]
     fn token_frame_matches_generic_encoding() {
-        let mut cases: Vec<Vec<u32>> = vec![
+        let mut cases: Vec<Vec<u64>> = vec![
             vec![],              // engine returned no new tokens
             vec![5],             // the steady-state case
             MAGNITUDES.to_vec(), // mixed widths in one list
