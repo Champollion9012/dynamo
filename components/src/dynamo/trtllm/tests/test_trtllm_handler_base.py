@@ -861,6 +861,103 @@ class TestGenerateLocally:
         assert kwargs["priority"] == DEFAULT_REQUEST_PRIORITY
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "error",
+        [
+            ValueError("invalid sampling bounds"),
+            TypeError("malformed inputs"),
+            NotImplementedError("unsupported input path"),
+        ],
+        ids=["value-error", "type-error", "not-implemented-error"],
+    )
+    async def test_presubmit_validation_error_is_request_local(self, error):
+        handler = self._make_handler()
+        handler.engine.llm.generate_async = MagicMock(side_effect=error)
+        handler.engine.check_health.return_value = True
+        handler._initiate_shutdown = mock.AsyncMock()
+
+        request = {
+            "token_ids": [1, 2, 3],
+            "stop_conditions": {"max_tokens": 10},
+            "sampling_options": {},
+        }
+        chunks = [
+            chunk
+            async for chunk in handler.generate_locally(request, self._make_context())
+        ]
+
+        assert chunks == [
+            {
+                "finish_reason": {"error": str(error)},
+                "token_ids": [],
+            }
+        ]
+        handler.engine.check_health.assert_called_once_with()
+        handler._initiate_shutdown.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_presubmit_validation_error_is_fatal_when_engine_is_unhealthy(self):
+        handler = self._make_handler()
+        error = ValueError("invalid request after engine failure")
+        handler.engine.llm.generate_async = MagicMock(side_effect=error)
+        handler.engine.check_health.return_value = False
+        handler._initiate_shutdown = mock.AsyncMock()
+
+        request = {
+            "token_ids": [1, 2, 3],
+            "stop_conditions": {"max_tokens": 10},
+            "sampling_options": {},
+        }
+        chunks = [
+            chunk
+            async for chunk in handler.generate_locally(request, self._make_context())
+        ]
+
+        assert chunks == [
+            {
+                "finish_reason": {"error": str(error)},
+                "token_ids": [],
+            }
+        ]
+        handler.engine.check_health.assert_called_once_with()
+        handler._initiate_shutdown.assert_awaited_once_with(error)
+
+    @pytest.mark.asyncio
+    async def test_validation_error_during_iteration_remains_fatal(self):
+        handler = self._make_handler()
+        error = ValueError("invalid executor result")
+        generation_result = MagicMock()
+        generation_result.abort = MagicMock()
+
+        async def raise_during_iteration(self_mock):
+            raise error
+            yield
+
+        generation_result.__aiter__ = raise_during_iteration
+        handler.engine.llm.generate_async = MagicMock(return_value=generation_result)
+        handler.engine.check_health.return_value = True
+        handler._initiate_shutdown = mock.AsyncMock()
+
+        request = {
+            "token_ids": [1, 2, 3],
+            "stop_conditions": {"max_tokens": 10},
+            "sampling_options": {},
+        }
+        chunks = [
+            chunk
+            async for chunk in handler.generate_locally(request, self._make_context())
+        ]
+
+        assert chunks == [
+            {
+                "finish_reason": {"error": str(error)},
+                "token_ids": [],
+            }
+        ]
+        handler.engine.check_health.assert_not_called()
+        handler._initiate_shutdown.assert_awaited_once_with(error)
+
+    @pytest.mark.asyncio
     async def test_zero_prompt_logprobs_is_forwarded_and_returned(self):
         handler = self._make_handler()
         prompt_logprob = MagicMock(

@@ -1240,17 +1240,37 @@ class HandlerBase(BaseGenerativeHandler):
             conv_kwargs = (
                 {"conversation_params": conversation_params} if conv_affinity else {}
             )
-            generation_result = self.engine.llm.generate_async(
-                inputs=processed_input,  # Use the correctly extracted inputs
-                sampling_params=sampling_params,
-                disaggregated_params=disaggregated_params,
-                streaming=streaming,
-                trace_headers=trace_headers,
-                scheduling_params=scheduling_params,
-                **conv_kwargs,
-                priority=priority,
-                cache_salt=cache_salt,
-            )
+            try:
+                generation_result = self.engine.llm.generate_async(
+                    inputs=processed_input,  # Use the correctly extracted inputs
+                    sampling_params=sampling_params,
+                    disaggregated_params=disaggregated_params,
+                    streaming=streaming,
+                    trace_headers=trace_headers,
+                    scheduling_params=scheduling_params,
+                    **conv_kwargs,
+                    priority=priority,
+                    cache_salt=cache_salt,
+                )
+            except (ValueError, TypeError, NotImplementedError) as e:
+                # TRT-LLM performs request validation and preprocessing synchronously in
+                # `generate_async()`, before executor submission. The below exception types are
+                # request-local here; the same types during result iteration can indicate an
+                # executor bug and must continue through the fatal path below.
+                if not self.engine.check_health():
+                    raise
+                error_msg = str(e)
+                logging.warning(
+                    "Request %s rejected during TensorRT-LLM preprocessing (%s): %s",
+                    request_id,
+                    type(e).__name__,
+                    error_msg,
+                )
+                yield {
+                    "finish_reason": {"error": error_msg},
+                    "token_ids": [],
+                }
+                return
 
             # Log the Dynamo-to-engine request-ID mapping exactly once per
             # request, immediately after submission. This is the only place the
