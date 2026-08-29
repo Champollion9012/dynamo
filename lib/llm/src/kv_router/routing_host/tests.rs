@@ -707,6 +707,14 @@ async fn router(session_affinity_ttl: Option<Duration>) -> (RoutingHost, Runtime
     router_with_workers(session_affinity_ttl, &[7]).await
 }
 
+async fn router_with_mode(
+    session_affinity_ttl: Option<Duration>,
+    session_affinity_mode: SessionAffinityMode,
+) -> (RoutingHost, Runtime) {
+    let workers = HashMap::from([(7, ModelRuntimeConfig::default())]);
+    router_with_worker_configs_and_mode(session_affinity_ttl, workers, session_affinity_mode).await
+}
+
 async fn router_with_workers(
     session_affinity_ttl: Option<Duration>,
     worker_ids: &[u64],
@@ -722,6 +730,15 @@ async fn router_with_workers(
 async fn router_with_worker_configs(
     session_affinity_ttl: Option<Duration>,
     workers: HashMap<u64, ModelRuntimeConfig>,
+) -> (RoutingHost, Runtime) {
+    router_with_worker_configs_and_mode(session_affinity_ttl, workers, SessionAffinityMode::Hard)
+        .await
+}
+
+async fn router_with_worker_configs_and_mode(
+    session_affinity_ttl: Option<Duration>,
+    workers: HashMap<u64, ModelRuntimeConfig>,
+    session_affinity_mode: SessionAffinityMode,
 ) -> (RoutingHost, Runtime) {
     let runtime = Runtime::from_current().unwrap();
     let distributed = DistributedRuntime::new(runtime.clone(), DistributedConfig::process_local())
@@ -762,7 +779,16 @@ async fn router_with_worker_configs(
     let inner = PushRouter::from_client(client, RouterMode::KV)
         .await
         .unwrap();
-    let router = RoutingHost::new(inner, Arc::new(chooser), session_affinity_ttl).unwrap();
+    let affinity = session_affinity_ttl
+        .map(AffinityCoordinator::new)
+        .transpose()
+        .unwrap();
+    let router = RoutingHost::new_with_coordinator(
+        inner,
+        Arc::new(chooser),
+        affinity,
+        session_affinity_mode,
+    );
     router
         .inner
         .client
@@ -785,6 +811,187 @@ async fn track_request(
         .await
         .unwrap();
     (request, selection, guard)
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn route_plan_holds_and_releases_the_decode_reservation() {
+    let (router, runtime) = router(None).await;
+    let request = Context::new(request());
+    let requests_started_before = router.request_metrics.requests_started_total().get();
+
+    let plan = router
+        .plan_kv_route(&request, RequestPhase::Decode)
+        .await
+        .expect("decode plan should admit one request");
+    assert_eq!(plan.signals().worker.worker_id, 7);
+    assert_eq!(
+        router.request_metrics.requests_started_total().get(),
+        requests_started_before,
+        "a topology decision is not a started request"
+    );
+    let admitted_loads = router
+        .kv_router()
+        .get_potential_loads(&[], None, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        admitted_loads
+            .iter()
+            .find(|load| load.worker_id == 7 && load.dp_rank == 0)
+            .expect("selected worker must be reported")
+            .active_requests,
+        1
+    );
+
+    plan.abort().await;
+    let released_loads = router
+        .kv_router()
+        .get_potential_loads(&[], None, None, None, None)
+        .await
+        .unwrap();
+    assert!(
+        released_loads.iter().all(|load| load.active_requests == 0),
+        "abandoned plans must release their scheduler reservation: {released_loads:?}"
+    );
+    assert_eq!(
+        router.request_metrics.requests_started_total().get(),
+        requests_started_before,
+        "an abandoned plan must not count as a started request"
+    );
+
+    drop(router);
+    runtime.shutdown();
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn planned_dispatch_transfers_the_reservation_to_request_cleanup() {
+    let (router, runtime) = router(None).await;
+    let requests_started_before = router.request_metrics.requests_started_total().get();
+    let request = Context::new(request());
+    let plan = router
+        .plan_kv_route(&request, RequestPhase::Decode)
+        .await
+        .unwrap();
+
+    assert!(router.dispatch_kv_plan(request, plan).await.is_err());
+    assert_eq!(
+        router.request_metrics.requests_started_total().get(),
+        requests_started_before + 1
+    );
+    let loads = router
+        .kv_router()
+        .get_potential_loads(&[], None, None, None, None)
+        .await
+        .unwrap();
+    assert!(loads.iter().all(|load| load.active_requests == 0));
+
+    drop(router);
+    runtime.shutdown();
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn failed_soft_route_plan_preserves_the_existing_binding() {
+    let (router, runtime) =
+        router_with_mode(Some(Duration::from_secs(10)), SessionAffinityMode::Soft).await;
+    let session_id = SessionAffinityId::new("failed-soft-route-plan");
+    let target = AffinityTarget::new(7, Some(0));
+    bind_affinity_target(&router, &session_id, target).await;
+    let mut request = Context::new(request());
+    request.insert(SESSION_AFFINITY_CONTEXT_KEY, session_id.clone());
+    let plan = router
+        .plan_kv_route(&request, RequestPhase::Decode)
+        .await
+        .unwrap();
+
+    assert!(router.dispatch_kv_plan(request, plan).await.is_err());
+    assert_eq!(
+        router
+            .affinity
+            .as_ref()
+            .unwrap()
+            .query_target(&session_id, None)
+            .unwrap(),
+        Some(target)
+    );
+
+    drop(router);
+    runtime.shutdown();
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn prefill_busy_probe_does_not_admit_a_request() {
+    let (router, runtime) = router(None).await;
+    let request = Context::new(request());
+    let requests_started_before = router.request_metrics.requests_started_total().get();
+
+    assert!(!router.prefill_worker_busy(&request, 0.5).await.unwrap());
+    let loads = router
+        .kv_router()
+        .get_potential_loads(&[], None, None, None, None)
+        .await
+        .unwrap();
+    assert!(loads.iter().all(|load| load.active_requests == 0));
+    assert_eq!(
+        router.request_metrics.requests_started_total().get(),
+        requests_started_before
+    );
+
+    drop(router);
+    runtime.shutdown();
+}
+
+#[tokio::test]
+async fn aborted_route_plan_drops_pending_affinity_initialization() {
+    let (router, runtime) = router(Some(Duration::from_secs(10))).await;
+    let bound_session = SessionAffinityId::new("abandoned-bound-route-plan");
+    let bound_target = AffinityTarget::new(7, Some(0));
+    bind_affinity_target(&router, &bound_session, bound_target).await;
+    let mut bound_request = Context::new(request());
+    bound_request.insert(SESSION_AFFINITY_CONTEXT_KEY, bound_session.clone());
+    router
+        .plan_kv_route(&bound_request, RequestPhase::Decode)
+        .await
+        .unwrap()
+        .abort()
+        .await;
+    assert_eq!(
+        router
+            .affinity
+            .as_ref()
+            .unwrap()
+            .query_target(&bound_session, None)
+            .unwrap(),
+        Some(bound_target)
+    );
+
+    let session_id = SessionAffinityId::new("abandoned-route-plan");
+    let mut request = Context::new(request());
+    request.insert(SESSION_AFFINITY_CONTEXT_KEY, session_id.clone());
+
+    router
+        .plan_kv_route(&request, RequestPhase::Decode)
+        .await
+        .unwrap()
+        .abort()
+        .await;
+
+    let affinity = router.affinity.as_ref().unwrap();
+    let acquisition = tokio::time::timeout(
+        Duration::from_millis(100),
+        affinity.acquire(&session_id, None),
+    )
+    .await
+    .expect("abandoned plan must not leave affinity initialization pending")
+    .unwrap();
+    assert!(matches!(acquisition, AffinityAcquire::Initialize(_)));
+    drop(acquisition);
+
+    drop(router);
+    runtime.shutdown();
 }
 
 #[tokio::test]
@@ -970,49 +1177,6 @@ async fn session_affinity_existing_selection_cancellation_preserves_binding_with
     };
     assert_eq!(target, original_target);
     drop(lease);
-
-    drop(router);
-    runtime.shutdown();
-}
-
-#[tokio::test]
-async fn query_affinity_target_returns_existing_binding_without_reserving() {
-    let (router, runtime) = router(Some(Duration::from_secs(10))).await;
-    let session_id = SessionAffinityId::new("query-existing-binding");
-    let target = AffinityTarget {
-        worker_id: 7,
-        dp_rank: Some(0),
-    };
-    let AffinityAcquire::Initialize(initializer) = router
-        .affinity
-        .as_ref()
-        .unwrap()
-        .acquire(&session_id, None)
-        .await
-        .unwrap()
-    else {
-        panic!("first request must initialize");
-    };
-    drop(initializer.commit(target).unwrap());
-
-    let mut request = Context::new(request());
-    request.insert(SESSION_AFFINITY_CONTEXT_KEY, session_id.clone());
-
-    assert_eq!(
-        router
-            .query_affinity_target(&request, RequestPhase::Prefill)
-            .unwrap(),
-        Some(target)
-    );
-    assert_eq!(
-        router
-            .affinity
-            .as_ref()
-            .unwrap()
-            .query_target(&session_id, None)
-            .unwrap(),
-        Some(target)
-    );
 
     drop(router);
     runtime.shutdown();

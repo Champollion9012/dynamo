@@ -14,9 +14,6 @@ use crate::{
     },
 };
 
-pub(crate) const ADVISORY_DECODE_TARGET_CONTEXT_KEY: &str =
-    "x-dynamo-internal-advisory-decode-target";
-
 pub fn affinity_id(
     request: &SingleIn<PreprocessedRequest>,
 ) -> Result<Option<Arc<SessionAffinityId>>, Error> {
@@ -29,54 +26,13 @@ pub fn explicit_target(
     request: &PreprocessedRequest,
     phase: RequestPhase,
 ) -> Result<Option<AffinityTarget>, Error> {
-    explicit_target_inner(request, phase, false)
-}
-
-pub(crate) fn explicit_target_for_routing(
-    request: &SingleIn<PreprocessedRequest>,
-    phase: RequestPhase,
-) -> Result<Option<AffinityTarget>, Error> {
-    let advisory_decode_target = if request
-        .routing
-        .as_ref()
-        .is_some_and(|routing| routing.decode_worker_id.is_some())
-    {
-        request
-            .get_optional::<()>(ADVISORY_DECODE_TARGET_CONTEXT_KEY)
-            .map_err(|message| {
-                invalid_argument(format!("invalid advisory target context: {message}"))
-            })?
-            .is_some()
-    } else {
-        false
-    };
-    explicit_target_inner(request.content(), phase, advisory_decode_target)
-}
-
-fn explicit_target_inner(
-    request: &PreprocessedRequest,
-    phase: RequestPhase,
-    advisory_decode_target: bool,
-) -> Result<Option<AffinityTarget>, Error> {
     let Some(routing) = request.routing.as_ref() else {
         return Ok(None);
     };
     let prefill_worker_id = routing.prefill_worker_id.or(routing.backend_instance_id);
-    let prefill_dp_rank = if advisory_decode_target && prefill_worker_id.is_none() {
-        None
-    } else {
-        routing.prefill_dp_rank.or(routing.dp_rank)
-    };
-    let decode_worker_id = if advisory_decode_target {
-        routing.backend_instance_id
-    } else {
-        routing.decode_worker_id.or(routing.backend_instance_id)
-    };
-    let decode_dp_rank = if advisory_decode_target && routing.backend_instance_id.is_none() {
-        None
-    } else {
-        routing.dp_rank
-    };
+    let prefill_dp_rank = routing.prefill_dp_rank.or(routing.dp_rank);
+    let decode_worker_id = routing.decode_worker_id.or(routing.backend_instance_id);
+    let decode_dp_rank = routing.dp_rank;
     let (worker_id, dp_rank) = match phase {
         RequestPhase::Prefill => (prefill_worker_id, prefill_dp_rank),
         RequestPhase::Decode => (decode_worker_id, decode_dp_rank),

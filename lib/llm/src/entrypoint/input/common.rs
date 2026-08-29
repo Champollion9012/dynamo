@@ -168,7 +168,7 @@ fn preprocessed_backend_engine<Sel>(
     affinity: Option<AffinityCoordinator>,
     session_affinity_mode: SessionAffinityMode,
     load_context: Arc<RoutingLoadContext>,
-) -> anyhow::Result<ServiceEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutput>>>>
+) -> anyhow::Result<Arc<RoutingHost<Sel>>>
 where
     Sel: WorkerSelector<crate::local_model::runtime_config::ModelRuntimeConfig> + Send + 'static,
 {
@@ -181,7 +181,7 @@ where
         affinity.is_some(),
     )?;
 
-    let engine: ServiceEngine<_, _> = match router_mode {
+    let routing_host = match router_mode {
         RouterMode::KV => {
             let Some(chooser) = chooser else {
                 anyhow::bail!("RouterMode::KV requires KVRouter to not be null");
@@ -208,7 +208,7 @@ where
         }
     };
 
-    Ok(engine)
+    Ok(routing_host)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -309,11 +309,7 @@ where
         )
     });
     let encoder_router = encoder_chooser.unwrap_or_else(EncoderRouter::disabled);
-    if router_mode.is_kv_routing() && prefill_router.conditional_disagg_enabled() {
-        prefill_router.set_decode_session_affinity(affinity.clone());
-    }
-
-    let backend_engine = preprocessed_backend_engine(
+    let routing_host = preprocessed_backend_engine(
         router,
         router_mode,
         chooser,
@@ -323,6 +319,10 @@ where
         session_affinity_mode,
         load_context,
     )?;
+    if router_mode.is_kv_routing() && prefill_router.conditional_disagg_enabled() {
+        prefill_router.set_decode_routing_host(routing_host.clone());
+    }
+    let backend_engine: ServiceEngine<_, _> = routing_host;
     Ok(PreprocessedRouting {
         backend_engine,
         prefill_router,

@@ -33,6 +33,7 @@ pub(super) struct SessionAffinityUpdate {
     pub session_id: String,
     pub worker_id: u64,
     pub dp_rank: Option<u32>,
+    #[serde(default)]
     pub sequence: u64,
     pub router_id: u64,
 }
@@ -71,21 +72,21 @@ struct ReplicaUpdateApplier {
 
 impl ReplicaUpdateApplier {
     fn apply(&self, source_publisher_id: u64, update: SessionAffinityUpdate) -> bool {
-        let instances = self.local_instances.borrow();
-        if !should_apply_update(
-            self.publisher_id,
-            source_publisher_id,
-            instances
-                .iter()
-                .any(|instance| instance.id() == update.worker_id),
-        ) {
+        if source_publisher_id == self.publisher_id {
             return true;
         }
-        drop(instances);
-
         let Some(coordinator) = self.coordinator.upgrade() else {
             return false;
         };
+        if !self
+            .local_instances
+            .borrow()
+            .iter()
+            .any(|instance| instance.id() == update.worker_id)
+        {
+            coordinator.observe_replica_sequence(update.sequence);
+            return true;
+        }
         let target = AffinityTarget {
             worker_id: update.worker_id,
             dp_rank: update.dp_rank,
@@ -95,7 +96,11 @@ impl ReplicaUpdateApplier {
             target,
             AffinityVersion {
                 sequence: update.sequence,
-                writer_id: update.router_id,
+                writer_id: if update.sequence == 0 {
+                    0
+                } else {
+                    update.router_id
+                },
             },
         );
         drop(coordinator);
@@ -289,14 +294,6 @@ impl Drop for ReplicaSyncRuntime {
     }
 }
 
-fn should_apply_update(
-    local_publisher_id: u64,
-    source_publisher_id: u64,
-    target_is_discovered: bool,
-) -> bool {
-    source_publisher_id != local_publisher_id && target_is_discovered
-}
-
 fn should_use_direct_sync(transport_kind: EventTransportKind, direct_zmq_topology: bool) -> bool {
     transport_kind == EventTransportKind::Zmq && direct_zmq_topology
 }
@@ -313,17 +310,58 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn replica_update_filter_rejects_self_and_unknown_workers() {
-        assert!(!should_apply_update(7, 7, true));
-        assert!(!should_apply_update(7, 8, false));
-        assert!(should_apply_update(7, 8, true));
-    }
-
-    #[test]
     fn direct_sync_is_selected_only_for_unbrokered_zmq() {
         assert!(should_use_direct_sync(EventTransportKind::Zmq, true));
         assert!(!should_use_direct_sync(EventTransportKind::Zmq, false));
         assert!(!should_use_direct_sync(EventTransportKind::Nats, false));
+    }
+
+    #[test]
+    fn legacy_update_without_sequence_decodes_as_unversioned() {
+        #[derive(Serialize)]
+        struct LegacySessionAffinityUpdate<'a> {
+            session_id: &'a str,
+            worker_id: u64,
+            dp_rank: Option<u32>,
+            router_id: u64,
+        }
+
+        let payload = Codec::default()
+            .encode_payload(&LegacySessionAffinityUpdate {
+                session_id: "legacy",
+                worker_id: 7,
+                dp_rank: Some(0),
+                router_id: 9,
+            })
+            .unwrap();
+        let update = Codec::default()
+            .decode_payload::<SessionAffinityUpdate>(&payload)
+            .unwrap();
+
+        assert_eq!(update.sequence, 0);
+    }
+
+    #[tokio::test]
+    async fn unknown_target_update_still_advances_the_logical_clock() {
+        let coordinator = AffinityCoordinator::new(Duration::from_secs(10)).unwrap();
+        let (_instances_tx, local_instances) = watch::channel(Vec::new());
+        let applier = ReplicaUpdateApplier {
+            publisher_id: 7,
+            local_instances,
+            coordinator: coordinator.inner_weak_for_test(),
+        };
+
+        assert!(applier.apply(
+            8,
+            SessionAffinityUpdate {
+                session_id: "unknown-target".to_string(),
+                worker_id: 11,
+                dp_rank: Some(0),
+                sequence: 1_000,
+                router_id: 8,
+            }
+        ));
+        assert!(coordinator.next_sequence_for_test() > 1_000);
     }
 
     #[tokio::test]

@@ -39,7 +39,7 @@ use crate::{
     },
     session_affinity::{
         AffinityAcquire, AffinityCoordinator, AffinityTarget, SessionAffinityMode, affinity_id,
-        explicit_target_for_routing, invalid_argument,
+        explicit_target, invalid_argument,
     },
 };
 
@@ -54,7 +54,7 @@ use builtin::BuiltinWorkerSelector;
 use cancellation::cancel_on_stop;
 use kv_selection::{RoutingRequestParts, SelectionOptions, WorkerSelection};
 use occupancy::HostedOccupancy;
-use request_guard::{LoraLoadGuard, RequestGuard};
+use request_guard::{KvRequestCleanup, LoraLoadGuard, RequestGuard};
 
 const OUTPUT_REPLAY_ID_ANNOTATION_KEY: &str = "output_replay_id";
 const OUTPUT_REPLAY_CONSUMER_RUNTIME_KEY: &str = "output_replay_consumer";
@@ -192,6 +192,45 @@ where
     /// Compatibility construction paths that predate routing load ownership leave this unset.
     #[allow(dead_code)]
     routing_context: Option<Arc<crate::kv_router::RoutingLoadContext>>,
+}
+
+/// An admitted KV route awaiting a topology decision.
+pub(crate) struct RoutePlan<Sel = DefaultWorkerSelector>
+where
+    Sel: WorkerSelector<ModelRuntimeConfig> + Send + 'static,
+{
+    signals: RoutePlanSignals,
+    selection: WorkerSelection,
+    cleanup: KvRequestCleanup<Sel>,
+    affinity: Option<AffinityAcquire>,
+}
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RoutePlanSignals {
+    pub(crate) worker: WorkerWithDpRank,
+    pub(crate) overlap_blocks: u32,
+    pub(crate) cached_tokens: usize,
+    pub(crate) potential_decode_blocks: u64,
+    pub(crate) total_kv_blocks: Option<u64>,
+}
+
+impl RoutePlanSignals {
+    pub(crate) fn decode_load_exceeds(self, threshold: f64) -> Option<bool> {
+        let total_kv_blocks = self.total_kv_blocks?;
+        Some(self.potential_decode_blocks as f64 > threshold * total_kv_blocks as f64)
+    }
+}
+
+impl<Sel> RoutePlan<Sel>
+where
+    Sel: WorkerSelector<ModelRuntimeConfig> + Send + 'static,
+{
+    pub(crate) fn signals(&self) -> RoutePlanSignals {
+        self.signals
+    }
+
+    pub(crate) async fn abort(mut self) {
+        self.cleanup.finish().await;
+    }
 }
 
 /// Compatibility name for the KV-only host used by existing callers.
@@ -440,21 +479,6 @@ where
         }
     }
 
-    pub(crate) fn query_affinity_target(
-        &self,
-        request: &SingleIn<PreprocessedRequest>,
-        phase: RequestPhase,
-    ) -> Result<Option<AffinityTarget>, Error> {
-        let Some(affinity) = self.affinity.as_ref() else {
-            return Ok(None);
-        };
-        let Some(session_id) = affinity_id(request)? else {
-            return Ok(None);
-        };
-        let explicit = explicit_target_for_routing(request, phase)?;
-        affinity.query_target(&session_id, explicit)
-    }
-
     fn affinity_target_is_valid(&self, target: AffinityTarget) -> bool {
         if self
             .inner
@@ -480,6 +504,21 @@ where
         (start..end).contains(&dp_rank)
     }
 
+    fn invalidate_dead_hard_affinity(
+        &self,
+        operation: &mut Option<AffinityAcquire>,
+        target: AffinityTarget,
+        error: &Error,
+    ) {
+        if !is_cancelled(error)
+            && self.session_affinity_mode == SessionAffinityMode::Hard
+            && !self.affinity_target_is_valid(target)
+            && let Some(operation) = operation.take()
+        {
+            operation.invalidate();
+        }
+    }
+
     async fn select_with_session_affinity<T, Select, SelectionFuture>(
         &self,
         request: &SingleIn<PreprocessedRequest>,
@@ -497,7 +536,7 @@ where
         let Some(session_id) = affinity_id(request)? else {
             return Ok((select(None).await?, None));
         };
-        let explicit = explicit_target_for_routing(request, phase)?;
+        let explicit = explicit_target(request.content(), phase)?;
         if is_query_only {
             let target = affinity.query_target(&session_id, explicit)?;
             return Ok((select(target).await?, None));
@@ -665,12 +704,7 @@ where
         let stream = match self.dispatch_selection(request, selection, guard).await {
             Ok(stream) => stream,
             Err(error) => {
-                if self.session_affinity_mode == SessionAffinityMode::Hard
-                    && !self.affinity_target_is_valid(selected_target)
-                    && let Some(operation) = operation.take()
-                {
-                    operation.invalidate();
-                }
+                self.invalidate_dead_hard_affinity(&mut operation, selected_target, &error);
                 return Err(error);
             }
         };

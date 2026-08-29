@@ -285,7 +285,7 @@ where
     {
         let phase_label = phase.to_string();
         let route_guard = StageGuard::new(STAGE_ROUTE, &phase_label);
-        let explicit = explicit_target_for_routing(&request, phase)?;
+        let explicit = explicit_target(request.content(), phase)?;
         let has_affinity_session = self.affinity.is_some() && affinity_id(&request)?.is_some();
         let is_direct = matches!(&self.policy, RoutingPolicy::Direct);
         if is_direct && explicit.is_none() && !has_affinity_session {
@@ -447,12 +447,7 @@ where
         let (metadata, target, final_occupancy, response_stream) = match dispatch_result {
             Ok(result) => result,
             Err(error) => {
-                if self.session_affinity_mode == SessionAffinityMode::Hard
-                    && !self.affinity_target_is_valid(expected_target)
-                    && let Some(operation) = operation.take()
-                {
-                    operation.invalidate();
-                }
+                self.invalidate_dead_hard_affinity(&mut operation, expected_target, &error);
                 let typed_error = error
                     .chain()
                     .find_map(|cause| cause.downcast_ref::<DynamoError>().cloned());

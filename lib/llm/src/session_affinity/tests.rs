@@ -15,10 +15,9 @@ use dynamo_runtime::{
 use futures::{StreamExt, stream};
 
 use super::{
-    ADVISORY_DECODE_TARGET_CONTEXT_KEY, AffinityAcquire, AffinityCoordinator, AffinityTarget,
-    LlmResponse, affinity_id,
+    AffinityAcquire, AffinityCoordinator, AffinityTarget, LlmResponse, affinity_id,
     coordinator::{ReplicaApplyOutcome, initial_affinity_sequence},
-    explicit_target, explicit_target_for_routing,
+    explicit_target,
 };
 use crate::{
     preprocessor::PreprocessedRequest,
@@ -130,30 +129,6 @@ fn session_affinity_explicit_targets_are_phase_local_and_preserve_rank_zero() {
         ..Default::default()
     });
     assert!(explicit_target(&rank_without_worker, RequestPhase::Decode).is_err());
-}
-
-#[test]
-fn advisory_decode_target_is_not_an_explicit_affinity_pin() {
-    let request = request_with_routing(RoutingHints {
-        decode_worker_id: Some(3),
-        dp_rank: Some(4),
-        ..Default::default()
-    });
-    let mut request = Context::new(request);
-    request.insert(ADVISORY_DECODE_TARGET_CONTEXT_KEY, ());
-
-    assert_eq!(
-        explicit_target_for_routing(&request, RequestPhase::Decode).unwrap(),
-        None
-    );
-    assert_eq!(
-        explicit_target_for_routing(&request, RequestPhase::Prefill).unwrap(),
-        None
-    );
-    assert_eq!(
-        explicit_target_for_routing(&request, RequestPhase::Aggregated).unwrap(),
-        None
-    );
 }
 
 #[test]

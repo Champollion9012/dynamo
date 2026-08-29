@@ -29,7 +29,6 @@ use crate::protocols::common::extensions::SessionAffinityId;
 mod stream;
 mod target;
 
-pub(crate) use target::{ADVISORY_DECODE_TARGET_CONTEXT_KEY, explicit_target_for_routing};
 pub use target::{affinity_id, explicit_target};
 use target::{validate_bound_target, validate_dispatch_target};
 
@@ -454,6 +453,11 @@ impl AffinityCoordinator {
         self.inner.next_sequence.load(Ordering::Relaxed)
     }
 
+    #[cfg(test)]
+    pub(super) fn inner_weak_for_test(&self) -> Weak<AffinityCoordinatorInner> {
+        Arc::downgrade(&self.inner)
+    }
+
     fn validate_session_id(&self, session_id: &SessionAffinityId) -> Result<(), Error> {
         if session_id.as_str().len() > self.inner.max_session_id_bytes {
             return Err(invalid_argument(format!(
@@ -499,6 +503,11 @@ impl AffinityCoordinatorInner {
         }
     }
 
+    pub(super) fn observe_replica_sequence(&self, sequence: u64) {
+        self.next_sequence
+            .fetch_max(sequence.saturating_add(1), Ordering::Relaxed);
+    }
+
     pub(super) fn apply_replica_update(
         &self,
         session_id: String,
@@ -508,8 +517,7 @@ impl AffinityCoordinatorInner {
         if session_id.len() > self.max_session_id_bytes {
             return ReplicaApplyOutcome::RejectedSessionId;
         }
-        self.next_sequence
-            .fetch_max(version.sequence.saturating_add(1), Ordering::Relaxed);
+        self.observe_replica_sequence(version.sequence);
 
         let now = Instant::now();
         match self.entries.entry(session_id) {
