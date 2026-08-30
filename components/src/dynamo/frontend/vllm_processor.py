@@ -80,6 +80,64 @@ def map_finish_reason(raw_reason: str | None) -> FinishReason | None:
     return mapped
 
 
+class _PyRequestTraceWriter:
+    """request_end emitter for the Python chat-processor path.
+
+    The Rust request-trace integration wraps only OpenAIPreprocessor streams,
+    so `--dyn-chat-processor vllm` never emits records even though the sinks
+    initialize. Write schema-compatible `dynamo.request.trace.v1` request_end
+    rows here instead, tagged event_source=harness to mark custom
+    instrumentation rather than the built-in Rust emitter.
+    """
+
+    def __init__(self, path: str) -> None:
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        self._file = open(path, "a", buffering=1)
+
+    def emit_request_end(self, metrics: dict[str, Any]) -> None:
+        record = {
+            "schema": "dynamo.request.trace.v1",
+            "event_type": "request_end",
+            "event_time_unix_ms": int(time.time() * 1000),
+            "event_source": "harness",
+            "request": {k: v for k, v in metrics.items() if v is not None},
+        }
+        try:
+            self._file.write(json.dumps(record, separators=(",", ":")) + "\n")
+            self._file.flush()
+        except Exception:
+            logger.exception("python request trace write failed")
+
+
+_REQUEST_TRACE_WRITER: _PyRequestTraceWriter | None = None
+_REQUEST_TRACE_WRITER_INIT = False
+
+
+def _request_trace_writer() -> _PyRequestTraceWriter | None:
+    global _REQUEST_TRACE_WRITER, _REQUEST_TRACE_WRITER_INIT
+    if not _REQUEST_TRACE_WRITER_INIT:
+        _REQUEST_TRACE_WRITER_INIT = True
+        enabled = os.getenv("DYN_REQUEST_TRACE", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        path = (os.getenv("DYN_REQUEST_TRACE_OUTPUT_PATH") or "").strip()
+        if enabled and path:
+            try:
+                _REQUEST_TRACE_WRITER = _PyRequestTraceWriter(path)
+                logger.info(
+                    "python request trace writer active (vllm chat-processor path): %s",
+                    path,
+                )
+            except Exception:
+                logger.exception("python request trace writer init failed")
+    return _REQUEST_TRACE_WRITER
+
+
 def _runtime_config_context_length(mdc: ModelDeploymentCard) -> int | None:
     runtime_config = mdc.runtime_config()
     if not isinstance(runtime_config, dict):
@@ -838,6 +896,9 @@ class VllmProcessor:
         # content-part counts here too (else frontend metrics report zero media).
         input_tokens = len(tokens)
         cumulative_output_tokens = 0
+        trace_start = time.time()
+        trace_first_token_time: float | None = None
+        trace_finish_reason: str | None = None
         _mm_counts, _ = extract_mm_urls(request.get("messages") or [])
         _mm_counts = _mm_counts or {}
         image_count = len(_mm_counts.get("image_url", []))
@@ -883,6 +944,8 @@ class VllmProcessor:
                 # consume tokens without emitting a visible delta.
                 chunk_tokens = len(engine_response.get("token_ids") or [])
                 cumulative_output_tokens += chunk_tokens
+                if trace_first_token_time is None and chunk_tokens:
+                    trace_first_token_time = time.time()
 
                 output_idx = engine_response.get("index", 0) or 0
                 output_request_id = output_request_ids.get(output_idx)
@@ -899,6 +962,8 @@ class VllmProcessor:
                     break
 
                 raw_finish_reason = engine_response.get("finish_reason")
+                if raw_finish_reason is not None:
+                    trace_finish_reason = raw_finish_reason
                 finish_reason = map_finish_reason(raw_finish_reason)
                 stop_reason = engine_response.get("stop_reason")
 
@@ -996,6 +1061,39 @@ class VllmProcessor:
                     self.output_processor.abort_requests(
                         [output_request_id], internal=True
                     )
+            writer = _request_trace_writer()
+            if writer is not None:
+                trace_end = time.time()
+                ttft_ms = (
+                    (trace_first_token_time - trace_start) * 1000.0
+                    if trace_first_token_time is not None
+                    else None
+                )
+                avg_itl_ms = (
+                    (trace_end - trace_first_token_time)
+                    * 1000.0
+                    / (cumulative_output_tokens - 1)
+                    if trace_first_token_time is not None
+                    and cumulative_output_tokens > 1
+                    else None
+                )
+                writer.emit_request_end(
+                    {
+                        "request_id": request_id,
+                        "model": request.get("model"),
+                        "input_tokens": input_tokens,
+                        "output_tokens": cumulative_output_tokens,
+                        "request_received_ms": int(trace_start * 1000),
+                        "ttft_ms": ttft_ms,
+                        "total_time_ms": (trace_end - trace_start) * 1000.0,
+                        "avg_itl_ms": avg_itl_ms,
+                        "finish_reason_metadata": (
+                            {"backend_finish_reason": trace_finish_reason}
+                            if trace_finish_reason is not None
+                            else None
+                        ),
+                    }
+                )
 
 
 class EngineFactory:
@@ -1058,6 +1156,16 @@ class EngineFactory:
             "config_format": config_format,
             "trust_remote_code": trust_remote_code,
         }
+        hf_config_path = os.getenv("DYN_VLLM_FRONTEND_HF_CONFIG_PATH")
+        if hf_config_path:
+            # Models whose MDC points at a metadata alias (e.g. Kimi-K3's
+            # frontend-only `model_type: kimi` alias for the Rust tokenizer)
+            # still need ModelConfig to resolve the real HF config so vLLM's
+            # built-in config class is selected over remote code.
+            model_config_kwargs["hf_config_path"] = hf_config_path
+            logger.info(
+                "Using frontend HuggingFace config override: %s", hf_config_path
+            )
         context_length = _runtime_config_context_length(mdc)
         if context_length:
             os.environ.setdefault("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
